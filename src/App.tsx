@@ -8,7 +8,6 @@ import * as THREE from 'three';
 import { createClient, type SupabaseClient, type User, type Session } from '@supabase/supabase-js';
 
 import characterTextureUrl from './assets/character.png';
-import { TerrainBuilder } from './TerrainBuilder';
 import { ChunkManager } from './ChunkManager';
 import { MapEditor } from './MapEditor';
 import { DebugUI } from './DebugUI';
@@ -386,7 +385,7 @@ export default function App() {
     mapEditorRef.current = mapEditor;
 
     // 5c. Debug UI (Ctrl+D toggle)
-    const debugUI = new DebugUI({ scene, terrainData: mapData });
+    const debugUI = new DebugUI({ scene, seed, chunkManager });
     debugUIRef.current = debugUI;
 
     // 6. Character material

@@ -1,20 +1,21 @@
 /**
- * DebugUI – Floating debug panel for continuous terrain inspection.
+ * DebugUI – Floating debug panel for terrain inspection.
  *
  * Toggle with Ctrl+D (or call debugUI.toggle()).
  *
  * Features:
  *   • Seed display + editor
  *   • Visual overlays: grid, height gradient, collision circles
- *   • FPS counter + rendered object count
+ *   • FPS counter + rendered object count + loaded chunks
  *   • Copy seed to clipboard
  *
  * Usage:
- *   const debug = new DebugUI({ scene, terrainData });
+ *   const debug = new DebugUI({ scene, seed, chunkManager });
  *   debug.update();      // call each frame
  *   debug.dispose();     // call on cleanup
  */
 import * as THREE from 'three';
+import { CHUNK_SIZE } from './shared/TerrainChunk.js';
 
 const HEIGHT_COLORS = [
   { t: 0.0, color: new THREE.Color(0x1a5fb4) },
@@ -39,11 +40,13 @@ export class DebugUI {
   /**
    * @param {object} opts
    * @param {THREE.Scene} opts.scene
-   * @param {object} opts.terrainData – { heightmap, decorations, collisionCircles, config }
+   * @param {number} opts.seed
+   * @param {import('./ChunkManager.js').ChunkManager} opts.chunkManager
    */
-  constructor({ scene, terrainData }) {
+  constructor({ scene, seed, chunkManager }) {
     this.scene = scene;
-    this.terrainData = terrainData;
+    this.seed = seed;
+    this.chunkManager = chunkManager;
 
     this.visible = false;
     this._overlayObjects = [];
@@ -83,15 +86,11 @@ export class DebugUI {
       if (child.isSprite) sprites++;
     });
     this._objectsEl.textContent = `${meshes}m ${sprites}s`;
-  }
 
-  setTerrainData(terrainData) {
-    this.terrainData = terrainData;
-    this._clearOverlays();
-    if (this.showGrid) this._applyGrid();
-    if (this.showHeights) this._applyHeights();
-    if (this.showCollisions) this._applyCollisions();
-    this._updateSeedDisplay();
+    // Show loaded chunks
+    if (this.chunkManager) {
+      this._chunksEl.textContent = this.chunkManager.loadedChunkCount;
+    }
   }
 
   dispose() {
@@ -115,7 +114,7 @@ export class DebugUI {
     `;
     panel.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
-        <span style="font-weight:700;color:#38bdf8;font-size:14px;">🔧 Debug Panel</span>
+        <span style="font-weight:700;color:#38bdf8;font-size:14px;">Debug Panel</span>
         <span style="font-size:10px;color:#64748b;">Ctrl+D</span>
       </div>
 
@@ -123,7 +122,7 @@ export class DebugUI {
         <label style="color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;">Seed</label>
         <div style="display:flex;gap:6px;margin-top:4px;">
           <input id="debug-seed" type="number" style="flex:1;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:4px 8px;border-radius:6px;font-family:monospace;" />
-          <button id="debug-seed-copy" title="Copy" style="background:#334155;color:#94a3b8;border:none;padding:4px 8px;border-radius:6px;cursor:pointer;">📋</button>
+          <button id="debug-seed-copy" title="Copy" style="background:#334155;color:#94a3b8;border:none;padding:4px 8px;border-radius:6px;cursor:pointer;">Copy</button>
         </div>
       </div>
 
@@ -131,7 +130,7 @@ export class DebugUI {
         <label style="color:#94a3b8;font-size:10px;text-transform:uppercase;letter-spacing:0.5px;">Overlays</label>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:4px;">
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;color:#cbd5e1;">
-            <input id="debug-grid" type="checkbox" /> Grid (10u)
+            <input id="debug-grid" type="checkbox" /> Grid
           </label>
           <label style="display:flex;align-items:center;gap:6px;cursor:pointer;color:#cbd5e1;">
             <input id="debug-heights" type="checkbox" /> Heights
@@ -142,20 +141,24 @@ export class DebugUI {
         </div>
       </div>
 
-      <div style="border-top:1px solid #1e293b;padding-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+      <div style="border-top:1px solid #1e293b;padding-top:8px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;">
         <div>
           <span style="color:#64748b;font-size:10px;">FPS</span>
-          <span id="debug-fps" style="display:block;color:#34d399;font-weight:700;font-size:18px;font-family:monospace;">—</span>
+          <span id="debug-fps" style="display:block;color:#34d399;font-weight:700;font-size:18px;font-family:monospace;">-</span>
         </div>
         <div>
           <span style="color:#64748b;font-size:10px;">Objects</span>
-          <span id="debug-objects" style="display:block;color:#fbbf24;font-weight:700;font-size:14px;font-family:monospace;">—</span>
+          <span id="debug-objects" style="display:block;color:#fbbf24;font-weight:700;font-size:14px;font-family:monospace;">-</span>
+        </div>
+        <div>
+          <span style="color:#64748b;font-size:10px;">Chunks</span>
+          <span id="debug-chunks" style="display:block;color:#38bdf8;font-weight:700;font-size:14px;font-family:monospace;">0</span>
         </div>
       </div>
 
       <div style="border-top:1px solid #1e293b;margin-top:8px;padding-top:8px;color:#64748b;font-size:10px;">
-        <div style="margin-bottom:2px;">Heights: <span style="color:#1a5fb4;">■</span> Low → <span style="color:#c01c28;">■</span> High</div>
-        <div>Collisions: <span style="color:#ef4444;">■</span> Blocked</div>
+        <div style="margin-bottom:2px;">Heights: Low -> High</div>
+        <div>Collisions: Red rings</div>
       </div>
     `;
     document.body.appendChild(panel);
@@ -168,24 +171,19 @@ export class DebugUI {
     this._collisionsCb = panel.querySelector('#debug-collisions');
     this._fpsEl = panel.querySelector('#debug-fps');
     this._objectsEl = panel.querySelector('#debug-objects');
+    this._chunksEl = panel.querySelector('#debug-chunks');
+
+    this._seedInput.value = this.seed || 42;
 
     this._seedCopyBtn.addEventListener('click', () => {
       navigator.clipboard?.writeText(this._seedInput.value);
-      this._seedCopyBtn.textContent = '✓';
-      setTimeout(() => { this._seedCopyBtn.textContent = '📋'; }, 1000);
+      this._seedCopyBtn.textContent = 'Copied';
+      setTimeout(() => { this._seedCopyBtn.textContent = 'Copy'; }, 1000);
     });
 
     this._gridCb.addEventListener('change', () => { this.showGrid = this._gridCb.checked; this._applyOverlays(); });
     this._heightsCb.addEventListener('change', () => { this.showHeights = this._heightsCb.checked; this._applyOverlays(); });
     this._collisionsCb.addEventListener('change', () => { this.showCollisions = this._collisionsCb.checked; this._applyOverlays(); });
-
-    this._updateSeedDisplay();
-  }
-
-  _updateSeedDisplay() {
-    if (this.terrainData?.config?.seed !== undefined) {
-      this._seedInput.value = this.terrainData.config.seed;
-    }
   }
 
   _bindKeyboard() {
@@ -222,76 +220,96 @@ export class DebugUI {
   }
 
   _applyGrid() {
-    if (!this.terrainData) return;
-    const size = this.terrainData.config.size;
+    if (!this.chunkManager) return;
 
-    const gridHelper = new THREE.GridHelper(size, size / 10, 0x60a5fa, 0x1e40af);
-    gridHelper.position.set(size / 2, 0.05, size / 2);
-    gridHelper.material.opacity = 0.3;
-    gridHelper.material.transparent = true;
-    this.scene.add(gridHelper);
-    this._overlayObjects.push(gridHelper);
+    const group = new THREE.Group();
+    const loadedChunks = Array.from(this.chunkManager.chunks.keys());
+
+    for (const key of loadedChunks) {
+      const [cx, cz] = key.split(',').map(Number);
+      const gridHelper = new THREE.GridHelper(CHUNK_SIZE, CHUNK_SIZE, 0x60a5fa, 0x1e40af);
+      gridHelper.position.set(cx * CHUNK_SIZE + CHUNK_SIZE / 2, 0.05, cz * CHUNK_SIZE + CHUNK_SIZE / 2);
+      gridHelper.material.opacity = 0.25;
+      gridHelper.material.transparent = true;
+      group.add(gridHelper);
+    }
+
+    this.scene.add(group);
+    this._overlayObjects.push(group);
   }
 
   _applyHeights() {
-    if (!this.terrainData) return;
-    const { size } = this.terrainData.config;
-    const { heightmap } = this.terrainData;
+    if (!this.chunkManager) return;
 
-    let minH = Infinity, maxH = -Infinity;
-    for (let z = 0; z < size; z++) {
-      for (let x = 0; x < size; x++) {
-        const h = heightmap[z][x];
-        if (h < minH) minH = h;
-        if (h > maxH) maxH = h;
-      }
-    }
-
-    // Sample every 4th cell for performance (200×200 = 40k quads is heavy)
-    const step = 4;
     const group = new THREE.Group();
-    for (let z = 0; z < size; z += step) {
-      for (let x = 0; x < size; x += step) {
-        const h = heightmap[z][x];
-        const color = heightToColor(h, minH, maxH);
-        const geo = new THREE.PlaneGeometry(step, step);
-        const mat = new THREE.MeshBasicMaterial({
-          color,
-          transparent: true,
-          opacity: 0.45,
-          side: THREE.DoubleSide,
-          depthWrite: false,
-        });
-        const quad = new THREE.Mesh(geo, mat);
-        quad.rotation.x = -Math.PI / 2;
-        quad.position.set(x + step / 2, h + 0.03, z + step / 2);
-        group.add(quad);
+    const step = 4;
+
+    for (const [key, chunk] of this.chunkManager.chunks) {
+      if (!chunk?.data) continue;
+      const { heightmap, worldOffsetX, worldOffsetZ } = chunk.data;
+
+      let minH = Infinity, maxH = -Infinity;
+      for (let z = 0; z < CHUNK_SIZE; z++) {
+        for (let x = 0; x < CHUNK_SIZE; x++) {
+          const h = heightmap[z][x];
+          if (h < minH) minH = h;
+          if (h > maxH) maxH = h;
+        }
+      }
+
+      for (let z = 0; z < CHUNK_SIZE; z += step) {
+        for (let x = 0; x < CHUNK_SIZE; x += step) {
+          const h = heightmap[z][x];
+          const color = heightToColor(h, minH, maxH);
+          const geo = new THREE.PlaneGeometry(step, step);
+          const mat = new THREE.MeshBasicMaterial({
+            color,
+            transparent: true,
+            opacity: 0.45,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          });
+          const quad = new THREE.Mesh(geo, mat);
+          quad.rotation.x = -Math.PI / 2;
+          quad.position.set(worldOffsetX + x + step / 2, h + 0.03, worldOffsetZ + z + step / 2);
+          group.add(quad);
+        }
       }
     }
+
     this.scene.add(group);
     this._overlayObjects.push(group);
   }
 
   _applyCollisions() {
-    if (!this.terrainData) return;
-    const { collisionCircles, heightmap } = this.terrainData;
+    if (!this.chunkManager) return;
 
     const group = new THREE.Group();
-    for (const c of collisionCircles) {
-      const h = heightmap[c.z]?.[c.x] ?? 0;
-      const ringGeo = new THREE.RingGeometry(c.radius * 0.8, c.radius, 16);
-      const ringMat = new THREE.MeshBasicMaterial({
-        color: 0xef4444,
-        transparent: true,
-        opacity: 0.5,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-      });
-      const ring = new THREE.Mesh(ringGeo, ringMat);
-      ring.rotation.x = -Math.PI / 2;
-      ring.position.set(c.x, h + 0.04, c.z);
-      group.add(ring);
+
+    for (const [, chunk] of this.chunkManager.chunks) {
+      if (!chunk?.data) continue;
+      const { collisionCircles, heightmap, worldOffsetX, worldOffsetZ } = chunk.data;
+
+      for (const c of collisionCircles) {
+        const localX = c.x - worldOffsetX;
+        const localZ = c.z - worldOffsetZ;
+        const h = heightmap[Math.floor(localZ)]?.[Math.floor(localX)] ?? 0;
+
+        const ringGeo = new THREE.RingGeometry(c.radius * 0.8, c.radius, 16);
+        const ringMat = new THREE.MeshBasicMaterial({
+          color: 0xef4444,
+          transparent: true,
+          opacity: 0.5,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        });
+        const ring = new THREE.Mesh(ringGeo, ringMat);
+        ring.rotation.x = -Math.PI / 2;
+        ring.position.set(c.x, h + 0.04, c.z);
+        group.add(ring);
+      }
     }
+
     this.scene.add(group);
     this._overlayObjects.push(group);
   }

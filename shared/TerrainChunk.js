@@ -157,7 +157,7 @@ export function getBiomeWeights(wx, wz, biomeNoise) {
 export function generateRivers(seed, numRivers = 3) {
   const rng = mulberry32(seed + 5000);
   const rivers = new Set();
-  const worldSize = 1000; // approximate world size for river generation
+  const worldSize = 256; // reasonable world size for chunk-based system
 
   for (let r = 0; r < numRivers; r++) {
     let x = Math.floor(rng() * worldSize);
@@ -180,6 +180,13 @@ export function generateRivers(seed, numRivers = 3) {
     }
   }
   return rivers;
+}
+
+/**
+ * Check if a world position is in a river.
+ */
+function isRiver(wx, wz, riverSet) {
+  return riverSet.has(`${wx},${wz}`);
 }
 
 // ─── Chunk Generation ───────────────────────────────────────────────────────
@@ -205,6 +212,9 @@ export function generateChunk(seed, cx, cz, overrides = null) {
   const worldOffsetX = cx * CHUNK_SIZE;
   const worldOffsetZ = cz * CHUNK_SIZE;
 
+  // Generate rivers once per seed (cached)
+  const riverSet = generateRivers(seed, 3);
+
   // Determine dominant biome for this chunk
   const centerX = worldOffsetX + CHUNK_SIZE / 2;
   const centerZ = worldOffsetZ + CHUNK_SIZE / 2;
@@ -213,12 +223,10 @@ export function generateChunk(seed, cx, cz, overrides = null) {
   // Generate heightmap
   const heightmap = [];
   const biomeMap = [];
-  const riverMask = [];
 
   for (let lz = 0; lz < CHUNK_SIZE; lz++) {
     heightmap[lz] = [];
     biomeMap[lz] = [];
-    riverMask[lz] = [];
 
     for (let lx = 0; lx < CHUNK_SIZE; lx++) {
       const wx = worldOffsetX + lx;
@@ -248,9 +256,11 @@ export function generateChunk(seed, cx, cz, overrides = null) {
         }
       }
 
-      // River carving
-      const riverKey = `${wx},${wz}`;
-      riverMask[lz][lx] = false; // Will be set below
+      // River carving: lower terrain where rivers flow
+      if (isRiver(wx, wz, riverSet)) {
+        h = Math.min(h, -0.5); // Carve river bed
+        primaryBiome = "swamp"; // Rivers count as swamp biome
+      }
 
       heightmap[lz][lx] = h;
       biomeMap[lz][lx] = primaryBiome;

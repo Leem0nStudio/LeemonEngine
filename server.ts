@@ -7,8 +7,6 @@ import dotenv from "dotenv";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import {
   generateTerrain,
-  generateHeightmap,
-  TERRAIN_SIZE,
   MAX_SLOPE_DEG,
 } from "./backend/terrainGenerator.js";
 import { Quadtree, buildQuadtree } from "./backend/Quadtree.js";

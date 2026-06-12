@@ -21,6 +21,8 @@
  */
 import express from "express";
 
+const MAX_MODS_PER_CHUNK = 200;
+
 /**
  * Create the Express router for map modifications.
  * @param {import("@supabase/supabase-js").SupabaseClient | null} supabase
@@ -65,6 +67,35 @@ export function createMapModificationsRouter(supabase, useMockDb, mockDb) {
 
     if (seed == null || cx == null || cz == null || !type || !modData) {
       return res.status(400).json({ error: "Missing required fields: seed, cx, cz, type, data" });
+    }
+
+    // Check modifications limit per chunk
+    if (useMockDb) {
+      const chunkMods = (mockDb.modifications || []).filter(
+        (m) => m.seed === seed && m.cx === cx && m.cz === cz
+      );
+      if (chunkMods.length >= MAX_MODS_PER_CHUNK) {
+        return res.status(400).json({
+          error: `Chunk (${cx},${cz}) exceeds maximum of ${MAX_MODS_PER_CHUNK} modifications`,
+        });
+      }
+    } else {
+      try {
+        const { count, error: countError } = await supabase
+          .from("map_modifications")
+          .select("id", { count: "exact", head: true })
+          .eq("seed", seed)
+          .eq("cx", cx)
+          .eq("cz", cz);
+
+        if (!countError && count >= MAX_MODS_PER_CHUNK) {
+          return res.status(400).json({
+            error: `Chunk (${cx},${cz}) exceeds maximum of ${MAX_MODS_PER_CHUNK} modifications`,
+          });
+        }
+      } catch (e) {
+        // If count fails, allow the insert (fail open)
+      }
     }
 
     const mod = {
@@ -118,6 +149,27 @@ export function createMapModificationsRouter(supabase, useMockDb, mockDb) {
 
     if (!Array.isArray(modifications) || modifications.length === 0) {
       return res.status(400).json({ error: "Missing or empty modifications array" });
+    }
+
+    // Check per-chunk limits for batch
+    const chunkCounts = {};
+    for (const m of modifications) {
+      const key = `${m.seed}:${m.cx}:${m.cz}`;
+      chunkCounts[key] = (chunkCounts[key] || 0) + 1;
+    }
+
+    if (useMockDb) {
+      for (const [key, added] of Object.entries(chunkCounts)) {
+        const [s, cx, cz] = key.split(":").map(Number);
+        const existing = (mockDb.modifications || []).filter(
+          (m) => m.seed === s && m.cx === cx && m.cz === cz
+        ).length;
+        if (existing + added > MAX_MODS_PER_CHUNK) {
+          return res.status(400).json({
+            error: `Chunk (${cx},${cz}) would exceed ${MAX_MODS_PER_CHUNK} modifications (has ${existing}, adding ${added})`,
+          });
+        }
+      }
     }
 
     const now = new Date().toISOString();

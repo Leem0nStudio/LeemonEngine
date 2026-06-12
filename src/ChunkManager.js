@@ -3,7 +3,7 @@
  *
  * Loads/unloads chunks based on player position.
  * Uses InstancedMesh for efficient decoration rendering.
- * Supports 3 LOD levels (full, half, quarter resolution).
+ * Offloads geometry generation to Web Worker when available.
  */
 import * as THREE from "three";
 import {
@@ -15,6 +15,56 @@ import {
   generateChunk,
   mulberry32,
 } from "../shared/TerrainChunk.js";
+
+// ─── Web Worker Setup ─────────────────────────────────────────────────────
+let chunkWorker = null;
+let workerCallbacks = new Map();
+let workerIdCounter = 0;
+
+try {
+  chunkWorker = new Worker(
+    new URL("./workers/chunkWorker.js", import.meta.url),
+    { type: "module" }
+  );
+  chunkWorker.onmessage = (e) => {
+    const { id, type } = e.data;
+    const cb = workerCallbacks.get(id);
+    if (cb) {
+      workerCallbacks.delete(id);
+      if (type === "result") cb.resolve(e.data);
+      else cb.reject(new Error(e.data.error));
+    }
+  };
+  chunkWorker.onerror = (err) => {
+    console.warn("[ChunkManager] Worker error, falling back to main thread:", err);
+    chunkWorker = null;
+  };
+} catch (e) {
+  console.warn("[ChunkManager] Web Workers not available, using main thread");
+}
+
+function generateChunkAsync(seed, cx, cz) {
+  return new Promise((resolve, reject) => {
+    if (chunkWorker) {
+      const id = workerIdCounter++;
+      workerCallbacks.set(id, { resolve, reject });
+      chunkWorker.postMessage({ type: "generate", seed, cx, cz, id });
+    } else {
+      // Fallback: generate on main thread
+      try {
+        const data = generateChunk(seed, cx, cz);
+        resolve({
+          cx, cz,
+          positions: null, // Will be built by _buildTerrainMesh
+          colors: null,
+          indices: null,
+        });
+      } catch (err) {
+        reject(err);
+      }
+    }
+  });
+}
 
 // ─── Color Palettes per Biome ───────────────────────────────────────────────
 const BIOME_COLORS = {
@@ -115,7 +165,7 @@ export class ChunkManager {
   }
 
   /**
-   * Load a chunk asynchronously using requestIdleCallback.
+   * Load a chunk asynchronously using Web Worker or requestIdleCallback.
    */
   _loadChunkAsync(cx, cz) {
     const key = `${cx},${cz}`;
@@ -124,14 +174,34 @@ export class ChunkManager {
     // Reserve the slot immediately to prevent double-loading
     this.chunks.set(key, { data: null, meshes: [], loading: true });
 
-    const loadFn = () => {
-      const data = generateChunk(this.seed, cx, cz);
+    const buildFromData = (data) => {
       const chunkEntry = this._buildChunkMeshes(data);
       this.chunks.set(key, chunkEntry);
     };
 
+    const loadFn = async () => {
+      try {
+        // Generate chunk data (worker or main thread)
+        const workerResult = await generateChunkAsync(this.seed, cx, cz);
+
+        // If worker returned pre-built geometry, use it directly
+        if (workerResult.positions) {
+          const data = generateChunk(this.seed, cx, cz); // Still need decorations
+          const chunkEntry = this._buildChunkMeshesFromWorker(data, workerResult);
+          this.chunks.set(key, chunkEntry);
+        } else {
+          // Fallback: generate full data on main thread
+          const data = generateChunk(this.seed, cx, cz);
+          buildFromData(data);
+        }
+      } catch (err) {
+        console.error(`[ChunkManager] Failed to load chunk (${cx},${cz}):`, err);
+        this.chunks.delete(key);
+      }
+    };
+
     if (typeof requestIdleCallback !== "undefined") {
-      requestIdleCallback(loadFn, { timeout: 100 });
+      requestIdleCallback(loadFn, { timeout: 150 });
     } else {
       setTimeout(loadFn, 0);
     }
@@ -148,6 +218,41 @@ export class ChunkManager {
     // 1. Terrain mesh (with vertex colors)
     const terrainMesh = this._buildTerrainMesh(data);
     meshes.push(terrainMesh);
+
+    // 2. Decoration instances
+    const decMeshes = this._buildDecorationMeshes(data);
+    meshes.push(...decMeshes);
+
+    // Add all to scene
+    for (const m of meshes) this.scene.add(m);
+
+    return { data, meshes };
+  }
+
+  /**
+   * Build meshes using pre-computed worker geometry data.
+   */
+  _buildChunkMeshesFromWorker(data, workerData) {
+    const meshes = [];
+
+    // 1. Terrain mesh from worker positions/colors/indices
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(workerData.positions, 3));
+    geometry.setAttribute("color", new THREE.BufferAttribute(workerData.colors, 3));
+    geometry.setIndex(new THREE.BufferAttribute(workerData.indices, 1));
+    geometry.computeVertexNormals();
+
+    const material = new THREE.MeshLambertMaterial({
+      vertexColors: true,
+      side: THREE.FrontSide,
+    });
+
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.receiveShadow = true;
+    mesh.userData.isTerrain = true;
+    mesh.userData.chunkCx = data.cx;
+    mesh.userData.chunkCz = data.cz;
+    meshes.push(mesh);
 
     // 2. Decoration instances
     const decMeshes = this._buildDecorationMeshes(data);
@@ -366,13 +471,20 @@ export class ChunkManager {
   }
 
   /**
-   * Dispose all chunks.
+   * Dispose all chunks and worker.
    */
   dispose() {
     for (const [, chunk] of this.chunks) {
       this._unloadChunk(chunk);
     }
     this.chunks.clear();
+
+    // Terminate worker
+    if (chunkWorker) {
+      chunkWorker.terminate();
+      chunkWorker = null;
+    }
+    workerCallbacks.clear();
   }
 
   /**
