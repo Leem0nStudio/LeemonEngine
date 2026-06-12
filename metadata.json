@@ -1,0 +1,6 @@
+{
+  "name": "Ragnarok Online 2.5D Clone",
+  "description": "An MVP for a 2.5D top-down RPG with networked player synchronization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
