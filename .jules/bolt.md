@@ -1,0 +1,3 @@
+## 2025-02-13 - [Three.js Resource Caching in ChunkManager]
+**Learning:** In a chunk-based terrain system, creating new materials and geometries for every chunk leads to high GPU memory usage and increased GC pressure. Shared resources (like decoration geometries and materials) should be cached and reused across chunks.
+**Action:** Use a resource cache (Maps) in `ChunkManager` to store and retrieve shared `THREE.Material` and `THREE.Geometry` instances. Ensure only unique resources (like chunk-specific terrain geometry) are disposed of during chunk unloading, while keeping shared resources until the manager itself is disposed.
