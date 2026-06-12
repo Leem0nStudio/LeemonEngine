@@ -1,386 +1,266 @@
 /**
- * TerrainBuilder – Client-side Three.js terrain construction.
+ * TerrainBuilder – Client-side Three.js continuous terrain construction.
  *
- * Receives the same map data the server generated (via the 'init' message)
- * and builds a matching visual scene so that collision checks stay in sync.
+ * Builds a 200×200 vertex mesh from a heightmap using BufferGeometry,
+ * with vertex colors (grass/dirt/stone by height & slope),
+ * 3D decoration models (trees, rocks, bushes, benches, lampposts),
+ * and hemisphere + directional lighting.
  *
  * Usage:
- *   const builder = new TerrainBuilder(scene, mapData, textureLoader);
+ *   const builder = new TerrainBuilder(scene, terrainData);
  *   builder.build();
- *   // …later…
- *   builder.dispose();   // clean up GPU resources
- *
- * The builder stores a public `heightMap` array so callers can query the
- * terrain height at any grid cell (e.g. for character Y positioning).
+ *   builder.getHeight(gridX, gridZ);
+ *   builder.dispose();
  */
+import * as THREE from 'three';
 
-// ─── Noise utilities (duplicated here to keep the client bundle self-contained) ─
-
-function mulberry32(seed) {
-  let s = seed | 0;
-  return function () {
-    s = (s + 0x6d2b79f5) | 0;
-    let t = Math.imul(s ^ (s >>> 15), 1 | s);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function valueNoise2D(x, y, rng) {
-  const ix = Math.floor(x);
-  const iy = Math.floor(y);
-  const fx = x - ix;
-  const fy = y - iy;
-  const u = fx * fx * (3 - 2 * fx);
-  const v = fy * fy * (3 - 2 * fy);
-
-  const seed = rng();
-  const hash = (cx, cy) => {
-    const s2 = mulberry32(seed + cx * 374761393 + cy * 668265263);
-    return s2();
-  };
-
-  const n00 = hash(ix, iy);
-  const n10 = hash(ix + 1, iy);
-  const n01 = hash(ix, iy + 1);
-  const n11 = hash(ix + 1, iy + 1);
-
-  const nx0 = n00 + (n10 - n00) * u;
-  const nx1 = n01 + (n11 - n01) * u;
-  return nx0 + (nx1 - nx0) * v;
-}
-
-function fbm(x, y, rng, octaves = 4, lacunarity = 2.0, gain = 0.5) {
-  let value = 0;
-  let amplitude = 1;
-  let frequency = 1;
-  let maxValue = 0;
-  for (let i = 0; i < octaves; i++) {
-    const layerRng = mulberry32((rng() * 2147483647) | 0);
-    value += amplitude * valueNoise2D(x * frequency, y * frequency, layerRng);
-    maxValue += amplitude;
-    amplitude *= gain;
-    frequency *= lacunarity;
-  }
-  return value / maxValue;
-}
-
-// ─── TerrainBuilder Class ────────────────────────────────────────────────────
 export class TerrainBuilder {
-  /**
-   * @param {THREE.Scene} scene
-   * @param {MapData}     mapData        – From generateMap() / server init
-   * @param {THREE.TextureLoader} textureLoader
-   */
-  constructor(scene, mapData, textureLoader) {
+  constructor(scene, terrainData) {
     this.scene = scene;
-    this.mapData = mapData;
-    this.textureLoader = textureLoader;
+    this.terrainData = terrainData;
+    this.heightmap = terrainData.heightmap;
+    this.decorations = terrainData.decorations || [];
+    this.config = terrainData.config;
 
-    /** Public height map – callers use getHeight(gridX, gridZ) */
-    this.heightMap = mapData.heightMap;
-    this.obstacleMap = mapData.obstacleMap;
-    this.portals = mapData.portals || [];
-    this.config = mapData.config;
-
-    /** Internal references for disposal */
     this._objects = [];
-    this._portalMeshes = [];
+    this._decorationObjects = [];
   }
 
-  // ── Public API ──────────────────────────────────────────────────────────
-
-  /** Build the entire terrain and add it to the scene. */
   build() {
-    if (this.config.type === 'field') {
-      this._buildField();
-    } else if (this.config.type === 'dungeon') {
-      this._buildDungeon();
-    }
-    this._buildPortals();
+    this._buildTerrainMesh();
+    this._buildDecorations();
+    this._buildLighting();
   }
 
-  /** Remove all Three.js objects from the scene and dispose GPU resources. */
   dispose() {
-    for (const obj of this._objects) {
+    const all = [...this._objects, ...this._decorationObjects];
+    for (const obj of all) {
       this.scene.remove(obj);
       obj.traverse((child) => {
         if (child.geometry) child.geometry.dispose();
         if (child.material) {
-          if (Array.isArray(child.material)) {
-            child.material.forEach((m) => m.dispose());
-          } else {
-            child.material.dispose();
-          }
+          if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+          else child.material.dispose();
         }
       });
     }
     this._objects = [];
-    this._portalMeshes = [];
+    this._decorationObjects = [];
   }
 
-  /** Get the terrain height at a grid position (for character Y placement). */
   getHeight(gridX, gridZ) {
-    const h = this.heightMap?.[gridZ]?.[gridX];
+    const h = this.heightmap?.[gridZ]?.[gridX];
     return h !== undefined ? h : 0;
   }
 
-  /** Check if a grid cell is an obstacle (returns the obstacle type or 0). */
-  getObstacle(gridX, gridZ) {
-    return this.obstacleMap?.[gridZ]?.[gridX] ?? 1; // Default to blocked
-  }
-
-  /** Get the world-space position for a grid cell. */
   gridToWorld(gridX, gridZ) {
-    const cs = this.config.cellSize || 5;
-    return {
-      x: (gridX + 0.5) * cs,
-      z: (gridZ + 0.5) * cs,
-    };
+    return { x: gridX, z: gridZ };
   }
 
-  // ── Field Terrain ───────────────────────────────────────────────────────
+  // ── Terrain Mesh ────────────────────────────────────────────────────────
 
-  _buildField() {
-    const { width, height, cellSize } = this.config;
+  _buildTerrainMesh() {
+    const size = this.config.size;
+    const heightmap = this.heightmap;
 
-    // 1. Ground plane with vertex displacement ──────────────────────────────
-    const segments = Math.max(width, height) * 2; // 2 verts per cell for smooth hills
-    const totalW = width * cellSize;
-    const totalH = height * cellSize;
-    const geometry = new THREE.PlaneGeometry(totalW, totalH, segments, segments);
+    const geometry = new THREE.BufferGeometry();
+    const vertexCount = size * size;
+    const positions = new Float32Array(vertexCount * 3);
+    const colors = new Float32Array(vertexCount * 3);
 
-    // Displace vertices according to the height map
-    const posAttr = geometry.getAttribute('position');
-    for (let i = 0; i < posAttr.count; i++) {
-      const vx = posAttr.getX(i);
-      const vy = posAttr.getY(i); // This is Z after rotation
+    // Color helpers
+    const grassGreen = new THREE.Color(0x4caf50);
+    const darkGrass = new THREE.Color(0x2e7d32);
+    const dirt = new THREE.Color(0x8d6e4a);
+    const stone = new THREE.Color(0x9e9e9e);
+    const pathDirt = new THREE.Color(0xa1887f);
+    const tmpColor = new THREE.Color();
 
-      // Convert world coord back to grid coord
-      const gx = Math.floor((vx + totalW / 2) / cellSize);
-      const gz = Math.floor((vy + totalH / 2) / cellSize);
+    for (let z = 0; z < size; z++) {
+      for (let x = 0; x < size; x++) {
+        const i = z * size + x;
+        const h = heightmap[z][x];
 
-      if (gx >= 0 && gx < width && gz >= 0 && gz < height) {
-        posAttr.setZ(i, this.heightMap[gz][gx]);
+        positions[i * 3] = x;
+        positions[i * 3 + 1] = h;
+        positions[i * 3 + 2] = z;
+
+        // Calculate slope for coloring
+        let slope = 0;
+        if (z > 0 && z < size - 1 && x > 0 && x < size - 1) {
+          const sx = Math.abs(heightmap[z][x + 1] - heightmap[z][x - 1]) / 2;
+          const sz = Math.abs(heightmap[z + 1][x] - heightmap[z - 1][x]) / 2;
+          slope = Math.sqrt(sx * sx + sz * sz);
+        }
+
+        // Color based on height + slope
+        if (slope > 1.2) {
+          tmpColor.copy(stone);
+        } else if (h < -0.5) {
+          tmpColor.copy(dirt);
+        } else if (h > 3.5) {
+          tmpColor.copy(darkGrass);
+        } else {
+          // Subtle variation using position
+          const v = Math.sin(x * 0.15) * Math.cos(z * 0.15) * 0.15;
+          tmpColor.copy(grassGreen);
+          tmpColor.r += v;
+          tmpColor.g += v;
+          tmpColor.b += v * 0.5;
+        }
+
+        colors[i * 3] = tmpColor.r;
+        colors[i * 3 + 1] = tmpColor.g;
+        colors[i * 3 + 2] = tmpColor.b;
       }
     }
-    posAttr.needsUpdate = true;
+
+    // Indices: two triangles per cell
+    const indices = [];
+    for (let z = 0; z < size - 1; z++) {
+      for (let x = 0; x < size - 1; x++) {
+        const tl = z * size + x;
+        const tr = tl + 1;
+        const bl = (z + 1) * size + x;
+        const br = bl + 1;
+        indices.push(tl, bl, tr);
+        indices.push(tr, bl, br);
+      }
+    }
+
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.setIndex(indices);
     geometry.computeVertexNormals();
 
-    // Green ground material
-    const groundMat = new THREE.MeshStandardMaterial({
-      color: 0x3a7d44,
-      roughness: 0.9,
-      metalness: 0.0,
-      flatShading: true,
+    const material = new THREE.MeshLambertMaterial({
+      vertexColors: true,
+      side: THREE.FrontSide,
     });
 
-    const ground = new THREE.Mesh(geometry, groundMat);
-    ground.rotation.x = -Math.PI / 2;
-    ground.position.set(totalW / 2, 0, totalH / 2);
-    this.scene.add(ground);
-    this._objects.push(ground);
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.receiveShadow = true;
+    mesh.castShadow = false;
+    mesh.userData.isTerrain = true;
+    this.scene.add(mesh);
+    this._objects.push(mesh);
+  }
 
-    // 2. Grid overlay ───────────────────────────────────────────────────────
-    const gridHelper = new THREE.GridHelper(
-      Math.max(totalW, totalH),
-      Math.max(width, height),
-      0x2d5a30,
-      0x1a3d1e,
-    );
-    gridHelper.position.set(totalW / 2, 0.02, totalH / 2);
-    this.scene.add(gridHelper);
-    this._objects.push(gridHelper);
+  // ── Decorations ─────────────────────────────────────────────────────────
 
-    // 3. Obstacles (trees + rocks) ──────────────────────────────────────────
-    const treeTrunkGeo = new THREE.CylinderGeometry(0.2, 0.3, 1.5, 6);
-    const treeTrunkMat = new THREE.MeshStandardMaterial({ color: 0x5c3a1e, roughness: 0.9 });
-    const treeLeafGeo = new THREE.ConeGeometry(1.0, 2.0, 6);
-    const treeLeafMat = new THREE.MeshStandardMaterial({ color: 0x2d6b2e, roughness: 0.8 });
-
+  _buildDecorations() {
+    // Shared geometries
+    const treeTrunkGeo = new THREE.CylinderGeometry(0.15, 0.25, 1.8, 6);
+    const treeCanopyGeo = new THREE.SphereGeometry(1.0, 6, 5);
     const rockGeo = new THREE.DodecahedronGeometry(0.5, 0);
-    const rockMat = new THREE.MeshStandardMaterial({ color: 0x6b6b6b, roughness: 0.95 });
+    const bushGeo = new THREE.SphereGeometry(0.4, 5, 4);
 
-    for (let z = 0; z < height; z++) {
-      for (let x = 0; x < width; x++) {
-        const cell = this.obstacleMap[z]?.[x];
-        if (cell === 0) continue;
+    // Shared materials
+    const treeTrunkMat = new THREE.MeshLambertMaterial({ color: 0x6d4c2a });
+    const treeCanopyMat = new THREE.MeshLambertMaterial({ color: 0x2e7d32 });
+    const rockMat = new THREE.MeshLambertMaterial({ color: 0x78909c });
+    const bushMat = new THREE.MeshLambertMaterial({ color: 0x388e3c });
+    const benchSeatMat = new THREE.MeshLambertMaterial({ color: 0x8d6e4a });
+    const benchLegMat = new THREE.MeshLambertMaterial({ color: 0x5d4037 });
+    const lampPoleMat = new THREE.MeshLambertMaterial({ color: 0x333333 });
+    const lampLightMat = new THREE.MeshBasicMaterial({ color: 0xffee88 });
 
-        const wx = (x + 0.5) * cellSize;
-        const wz = (z + 0.5) * cellSize;
-        const h = this.heightMap[z][x];
+    for (const dec of this.decorations) {
+      const h = this.heightmap[dec.z]?.[dec.x] ?? 0;
 
-        if (cell === 2) {
-          // Tree: trunk + cone canopy
+      switch (dec.type) {
+        case 'tree': {
           const trunk = new THREE.Mesh(treeTrunkGeo, treeTrunkMat);
-          trunk.position.set(wx, h + 0.75, wz);
+          trunk.position.set(dec.x, h + 0.9, dec.z);
           this.scene.add(trunk);
-          this._objects.push(trunk);
+          this._decorationObjects.push(trunk);
 
-          const canopy = new THREE.Mesh(treeLeafGeo, treeLeafMat);
-          canopy.position.set(wx, h + 2.5, wz);
+          const canopy = new THREE.Mesh(treeCanopyGeo, treeCanopyMat);
+          canopy.position.set(dec.x, h + 2.6, dec.z);
+          canopy.scale.set(1, 0.8, 1);
           this.scene.add(canopy);
-          this._objects.push(canopy);
-        } else if (cell === 3) {
-          // Rock
+          this._decorationObjects.push(canopy);
+          break;
+        }
+        case 'rock': {
           const rock = new THREE.Mesh(rockGeo, rockMat);
-          rock.position.set(wx, h + 0.3, wz);
-          rock.scale.set(0.8 + Math.random() * 0.4, 0.6 + Math.random() * 0.3, 0.8 + Math.random() * 0.4);
+          const s = 0.7 + (dec.ry / (Math.PI * 2)) * 0.6;
+          rock.position.set(dec.x, h + s * 0.3, dec.z);
+          rock.scale.set(s, s * 0.7, s);
+          rock.rotation.y = dec.ry;
           this.scene.add(rock);
-          this._objects.push(rock);
-        } else {
-          // Generic obstacle – stone block
-          const block = new THREE.Mesh(
-            new THREE.BoxGeometry(cellSize * 0.9, 1.2, cellSize * 0.9),
-            new THREE.MeshStandardMaterial({ color: 0x555555, roughness: 0.8 }),
-          );
-          block.position.set(wx, h + 0.6, wz);
-          this.scene.add(block);
-          this._objects.push(block);
+          this._decorationObjects.push(rock);
+          break;
         }
-      }
-    }
-
-    // 4. Border walls ───────────────────────────────────────────────────────
-    const wallGeo = new THREE.BoxGeometry(cellSize, 2, cellSize);
-    const wallMat = new THREE.MeshStandardMaterial({ color: 0x4a3728, roughness: 0.85 });
-    for (let z = 0; z < height; z++) {
-      for (let x = 0; x < width; x++) {
-        if (this.obstacleMap[z][x] === 1) {
-          // Only render border walls (row/col 0 or max)
-          const isBorder = x === 0 || x === width - 1 || z === 0 || z === height - 1;
-          if (!isBorder) continue;
-
-          const wx = (x + 0.5) * cellSize;
-          const wz = (z + 0.5) * cellSize;
-          const h = this.heightMap[z][x];
-          const wall = new THREE.Mesh(wallGeo, wallMat);
-          wall.position.set(wx, h + 1, wz);
-          this.scene.add(wall);
-          this._objects.push(wall);
+        case 'bush': {
+          const bush = new THREE.Mesh(bushGeo, bushMat);
+          bush.position.set(dec.x, h + 0.3, dec.z);
+          bush.scale.set(1, 0.7, 1);
+          this.scene.add(bush);
+          this._decorationObjects.push(bush);
+          break;
         }
-      }
-    }
-  }
+        case 'bench': {
+          const seat = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.08, 0.4), benchSeatMat);
+          seat.position.set(dec.x, h + 0.45, dec.z);
+          seat.rotation.y = dec.ry;
+          this.scene.add(seat);
+          this._decorationObjects.push(seat);
 
-  // ── Dungeon Terrain ─────────────────────────────────────────────────────
-
-  _buildDungeon() {
-    const { width, height, cellSize } = this.config;
-
-    // 1. Floor quads for walkable cells ─────────────────────────────────────
-    const floorGeo = new THREE.PlaneGeometry(cellSize * 0.98, cellSize * 0.98);
-    const floorMat = new THREE.MeshStandardMaterial({
-      color: 0x4a4a5a,
-      roughness: 0.95,
-      metalness: 0.05,
-    });
-
-    // Merge all floor quads into one geometry for a single draw call
-    const floorGroup = new THREE.Group();
-    for (let z = 0; z < height; z++) {
-      for (let x = 0; x < width; x++) {
-        if (this.obstacleMap[z][x] !== 0) continue;
-        const floor = new THREE.Mesh(floorGeo, floorMat);
-        floor.rotation.x = -Math.PI / 2;
-        floor.position.set((x + 0.5) * cellSize, 0, (z + 0.5) * cellSize);
-        floorGroup.add(floor);
-      }
-    }
-    this.scene.add(floorGroup);
-    this._objects.push(floorGroup);
-
-    // 2. Wall blocks ────────────────────────────────────────────────────────
-    const wallGeo = new THREE.BoxGeometry(cellSize * 0.98, cellSize * 0.8, cellSize * 0.98);
-    const wallMat = new THREE.MeshStandardMaterial({
-      color: 0x3a3a4a,
-      roughness: 0.85,
-      metalness: 0.1,
-    });
-
-    for (let z = 0; z < height; z++) {
-      for (let x = 0; x < width; x++) {
-        if (this.obstacleMap[z][x] !== 1) continue;
-
-        // Only render walls adjacent to walkable cells (optimisation)
-        let adjacent = false;
-        for (let dz = -1; dz <= 1 && !adjacent; dz++) {
-          for (let dx = -1; dx <= 1 && !adjacent; dx++) {
-            const nz = z + dz;
-            const nx = x + dx;
-            if (nz >= 0 && nz < height && nx >= 0 && nx < width) {
-              if (this.obstacleMap[nz][nx] === 0) adjacent = true;
-            }
+          const legGeo = new THREE.BoxGeometry(0.08, 0.45, 0.08);
+          for (const [ox, oz] of [[-0.5, -0.15], [0.5, -0.15], [-0.5, 0.15], [0.5, 0.15]]) {
+            const leg = new THREE.Mesh(legGeo, benchLegMat);
+            leg.position.set(dec.x + ox, h + 0.22, dec.z + oz);
+            this.scene.add(leg);
+            this._decorationObjects.push(leg);
           }
+          break;
         }
-        if (!adjacent) continue;
+        case 'lamppost': {
+          const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.08, 2.5, 6), lampPoleMat);
+          pole.position.set(dec.x, h + 1.25, dec.z);
+          this.scene.add(pole);
+          this._decorationObjects.push(pole);
 
-        const wall = new THREE.Mesh(wallGeo, wallMat);
-        wall.position.set((x + 0.5) * cellSize, cellSize * 0.4, (z + 0.5) * cellSize);
-        this.scene.add(wall);
-        this._objects.push(wall);
+          const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.15, 6, 4), lampLightMat);
+          lamp.position.set(dec.x, h + 2.6, dec.z);
+          this.scene.add(lamp);
+          this._decorationObjects.push(lamp);
+
+          const light = new THREE.PointLight(0xffcc44, 0.5, 12);
+          light.position.set(dec.x, h + 2.5, dec.z);
+          this.scene.add(light);
+          this._decorationObjects.push(light);
+          break;
+        }
       }
     }
-
-    // 3. Ceiling (dark) ─────────────────────────────────────────────────────
-    const ceilGeo = new THREE.PlaneGeometry(width * cellSize, height * cellSize);
-    const ceilMat = new THREE.MeshStandardMaterial({
-      color: 0x1a1a2e,
-      roughness: 1.0,
-      side: THREE.DoubleSide,
-    });
-    const ceiling = new THREE.Mesh(ceilGeo, ceilMat);
-    ceiling.rotation.x = Math.PI / 2;
-    ceiling.position.set(
-      (width * cellSize) / 2,
-      cellSize * 0.8,
-      (height * cellSize) / 2,
-    );
-    this.scene.add(ceiling);
-    this._objects.push(ceiling);
   }
 
-  // ── Portals ─────────────────────────────────────────────────────────────
+  // ── Lighting ────────────────────────────────────────────────────────────
 
-  _buildPortals() {
-    for (const portal of this.portals) {
-      const { x, z } = portal;
-      const cs = this.config.cellSize || 5;
-      const wx = (x + 0.5) * cs;
-      const wz = (z + 0.5) * cs;
-      const h = this.heightMap?.[z]?.[x] ?? 0;
+  _buildLighting() {
+    const hemi = new THREE.HemisphereLight(0x87ceeb, 0x4caf50, 0.7);
+    this.scene.add(hemi);
+    this._objects.push(hemi);
 
-      // Glowing red circle on the ground
-      const portalGeo = new THREE.CylinderGeometry(cs * 0.35, cs * 0.35, 0.15, 24);
-      const portalMat = new THREE.MeshStandardMaterial({
-        color: 0xff3333,
-        emissive: 0xff1111,
-        emissiveIntensity: 0.8,
-        transparent: true,
-        opacity: 0.85,
-        roughness: 0.2,
-        metalness: 0.5,
-      });
-      const portalMesh = new THREE.Mesh(portalGeo, portalMat);
-      portalMesh.position.set(wx, h + 0.1, wz);
-      this.scene.add(portalMesh);
-      this._objects.push(portalMesh);
-      this._portalMeshes.push(portalMesh);
+    const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+    sun.position.set(80, 120, 80);
+    sun.castShadow = true;
+    sun.shadow.mapSize.width = 2048;
+    sun.shadow.mapSize.height = 2048;
+    const d = 100;
+    sun.shadow.camera.left = -d;
+    sun.shadow.camera.right = d;
+    sun.shadow.camera.top = d;
+    sun.shadow.camera.bottom = -d;
+    sun.shadow.camera.near = 0.5;
+    sun.shadow.camera.far = 300;
+    this.scene.add(sun);
+    this._objects.push(sun);
 
-      // Pulsing ring effect
-      const ringGeo = new THREE.RingGeometry(cs * 0.38, cs * 0.45, 32);
-      const ringMat = new THREE.MeshBasicMaterial({
-        color: 0xff6600,
-        transparent: true,
-        opacity: 0.5,
-        side: THREE.DoubleSide,
-      });
-      const ring = new THREE.Mesh(ringGeo, ringMat);
-      ring.rotation.x = -Math.PI / 2;
-      ring.position.set(wx, h + 0.12, wz);
-      this.scene.add(ring);
-      this._objects.push(ring);
-      this._portalMeshes.push(ring);
-    }
+    const ambient = new THREE.AmbientLight(0xffffff, 0.35);
+    this.scene.add(ambient);
+    this._objects.push(ambient);
   }
 }

@@ -1,0 +1,420 @@
+/**
+ * ChunkManager.js – Client-side chunk streaming, LOD, and InstancedMesh.
+ *
+ * Loads/unloads chunks based on player position.
+ * Uses InstancedMesh for efficient decoration rendering.
+ * Supports 3 LOD levels (full, half, quarter resolution).
+ */
+import * as THREE from "three";
+import {
+  CHUNK_SIZE,
+  CHUNK_WORLD_SIZE,
+  VIEW_RADIUS,
+  LOD_LEVELS,
+  BIOMES,
+  generateChunk,
+  mulberry32,
+} from "../shared/TerrainChunk.js";
+
+// ─── Color Palettes per Biome ───────────────────────────────────────────────
+const BIOME_COLORS = {
+  prairie: {
+    grass: new THREE.Color(0x5daa35),
+    dirt: new THREE.Color(0x8c6e42),
+    stone: new THREE.Color(0x9e9e9e),
+  },
+  forest: {
+    grass: new THREE.Color(0x2e7d32),
+    dirt: new THREE.Color(0x6d4c2a),
+    stone: new THREE.Color(0x808080),
+  },
+  desert: {
+    grass: new THREE.Color(0xd4c573),
+    dirt: new THREE.Color(0xc4a84a),
+    stone: new THREE.Color(0xb0a080),
+  },
+  snow: {
+    grass: new THREE.Color(0xe8edf2),
+    dirt: new THREE.Color(0xb0b5ba),
+    stone: new THREE.Color(0x90959a),
+  },
+  swamp: {
+    grass: new THREE.Color(0x4a7035),
+    dirt: new THREE.Color(0x665c33),
+    stone: new THREE.Color(0x707560),
+  },
+};
+
+// ─── Decoration Templates ───────────────────────────────────────────────────
+const TREE_CONFIGS = {
+  oak: { trunkH: 2, trunkR: 0.2, canopyR: 1.2, canopyH: 1.5, trunkColor: 0x6d4c2a, canopyColor: 0x2e7d32 },
+  birch: { trunkH: 2.5, trunkR: 0.12, canopyR: 0.8, canopyH: 1.8, trunkColor: 0xd4c8b0, canopyColor: 0x4caf50 },
+  pine: { trunkH: 3, trunkR: 0.15, canopyR: 0.9, canopyH: 2.2, trunkColor: 0x5d4037, canopyColor: 0x1b5e20 },
+  pine_snow: { trunkH: 3, trunkR: 0.15, canopyR: 0.9, canopyH: 2.2, trunkColor: 0x5d4037, canopyColor: 0xcfd8dc },
+  cactus: { trunkH: 2, trunkR: 0.3, canopyR: 0, canopyH: 0, trunkColor: 0x558b2f, canopyColor: 0 },
+  dead_tree: { trunkH: 2.5, trunkR: 0.18, canopyR: 0, canopyH: 0, trunkColor: 0x795548, canopyColor: 0 },
+  willow: { trunkH: 2.2, trunkR: 0.2, canopyR: 1.5, canopyH: 1.2, trunkColor: 0x5d4037, canopyColor: 0x689f38 },
+};
+
+const ROCK_COLORS = [0x78909c, 0x607d8b, 0x90a4ae, 0x546e7a];
+
+export class ChunkManager {
+  /**
+   * @param {THREE.Scene} scene
+   * @param {number} seed - Global world seed
+   */
+  constructor(scene, seed) {
+    this.scene = scene;
+    this.seed = seed;
+    this.chunks = new Map(); // key: "cx,cz" -> { data, mesh, decorations, ... }
+    this.lastPlayerChunk = { cx: -999, cz: -999 };
+
+    // Shared geometries for instancing
+    this._treeTrunkGeo = new THREE.CylinderGeometry(0.15, 0.25, 1, 6);
+    this._treeCanopyGeo = new THREE.SphereGeometry(1, 6, 5);
+    this._rockGeo = new THREE.DodecahedronGeometry(0.5, 0);
+    this._bushGeo = new THREE.SphereGeometry(0.4, 5, 4);
+    this._flowerGeo = new THREE.ConeGeometry(0.1, 0.3, 4);
+  }
+
+  /**
+   * Call when player moves. Loads/unloads chunks as needed.
+   * @param {number} playerX - World X
+   * @param {number} playerZ - World Z
+   */
+  update(playerX, playerZ) {
+    const pcx = Math.floor(playerX / CHUNK_SIZE);
+    const pcz = Math.floor(playerZ / CHUNK_SIZE);
+
+    if (pcx === this.lastPlayerChunk.cx && pcz === this.lastPlayerChunk.cz) return;
+    this.lastPlayerChunk = { cx: pcx, cz: pcz };
+
+    // Determine which chunks should be loaded
+    const needed = new Set();
+    for (let dz = -VIEW_RADIUS; dz <= VIEW_RADIUS; dz++) {
+      for (let dx = -VIEW_RADIUS; dx <= VIEW_RADIUS; dx++) {
+        needed.add(`${pcx + dx},${pcz + dz}`);
+      }
+    }
+
+    // Unload chunks no longer needed
+    for (const [key, chunk] of this.chunks) {
+      if (!needed.has(key)) {
+        this._unloadChunk(chunk);
+        this.chunks.delete(key);
+      }
+    }
+
+    // Load new chunks (using requestIdleCallback for non-blocking)
+    for (const key of needed) {
+      if (!this.chunks.has(key)) {
+        const [cx, cz] = key.split(",").map(Number);
+        this._loadChunkAsync(cx, cz);
+      }
+    }
+  }
+
+  /**
+   * Load a chunk asynchronously using requestIdleCallback.
+   */
+  _loadChunkAsync(cx, cz) {
+    const key = `${cx},${cz}`;
+    if (this.chunks.has(key)) return;
+
+    // Reserve the slot immediately to prevent double-loading
+    this.chunks.set(key, { data: null, meshes: [], loading: true });
+
+    const loadFn = () => {
+      const data = generateChunk(this.seed, cx, cz);
+      const chunkEntry = this._buildChunkMeshes(data);
+      this.chunks.set(key, chunkEntry);
+    };
+
+    if (typeof requestIdleCallback !== "undefined") {
+      requestIdleCallback(loadFn, { timeout: 100 });
+    } else {
+      setTimeout(loadFn, 0);
+    }
+  }
+
+  /**
+   * Build Three.js meshes for a chunk.
+   */
+  _buildChunkMeshes(data) {
+    const meshes = [];
+    const worldOffsetX = data.cx * CHUNK_SIZE;
+    const worldOffsetZ = data.cz * CHUNK_SIZE;
+
+    // 1. Terrain mesh (with vertex colors)
+    const terrainMesh = this._buildTerrainMesh(data);
+    meshes.push(terrainMesh);
+
+    // 2. Decoration instances
+    const decMeshes = this._buildDecorationMeshes(data);
+    meshes.push(...decMeshes);
+
+    // Add all to scene
+    for (const m of meshes) this.scene.add(m);
+
+    return { data, meshes };
+  }
+
+  /**
+   * Build terrain mesh for a chunk with vertex colors.
+   */
+  _buildTerrainMesh(data) {
+    const { heightmap, biomeMap } = data;
+    const size = CHUNK_SIZE;
+
+    const geometry = new THREE.BufferGeometry();
+    const vertexCount = size * size;
+    const positions = new Float32Array(vertexCount * 3);
+    const colors = new Float32Array(vertexCount * 3);
+    const tmpColor = new THREE.Color();
+
+    for (let lz = 0; lz < size; lz++) {
+      for (let lx = 0; lx < size; lx++) {
+        const i = lz * size + lx;
+        const h = heightmap[lz][lx];
+        const biome = biomeMap[lz][lx];
+        const palette = BIOME_COLORS[biome] || BIOME_COLORS.prairie;
+
+        positions[i * 3] = data.worldOffsetX + lx;
+        positions[i * 3 + 1] = h;
+        positions[i * 3 + 2] = data.worldOffsetZ + lz;
+
+        // Slope-based coloring
+        let slope = 0;
+        if (lz > 0 && lz < size - 1 && lx > 0 && lx < size - 1) {
+          const sx = Math.abs(heightmap[lz][lx + 1] - heightmap[lz][lx - 1]) / 2;
+          const sz = Math.abs(heightmap[lz + 1][lx] - heightmap[lz - 1][lx]) / 2;
+          slope = Math.sqrt(sx * sx + sz * sz);
+        }
+
+        if (slope > 1.5) {
+          tmpColor.copy(palette.stone);
+        } else if (slope > 0.8) {
+          tmpColor.copy(palette.dirt);
+        } else {
+          tmpColor.copy(palette.grass);
+          // Subtle variation
+          const v = Math.sin((data.worldOffsetX + lx) * 0.2) * Math.cos((data.worldOffsetZ + lz) * 0.2) * 0.08;
+          tmpColor.r += v;
+          tmpColor.g += v;
+        }
+
+        colors[i * 3] = tmpColor.r;
+        colors[i * 3 + 1] = tmpColor.g;
+        colors[i * 3 + 2] = tmpColor.b;
+      }
+    }
+
+    // Indices
+    const indices = [];
+    for (let lz = 0; lz < size - 1; lz++) {
+      for (let lx = 0; lx < size - 1; lx++) {
+        const tl = lz * size + lx;
+        const tr = tl + 1;
+        const bl = (lz + 1) * size + lx;
+        const br = bl + 1;
+        indices.push(tl, bl, tr, tr, bl, br);
+      }
+    }
+
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    geometry.setIndex(indices);
+    geometry.computeVertexNormals();
+
+    const material = new THREE.MeshLambertMaterial({
+      vertexColors: true,
+      side: THREE.FrontSide,
+    });
+
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.receiveShadow = true;
+    mesh.userData.isTerrain = true;
+    mesh.userData.chunkCx = data.cx;
+    mesh.userData.chunkCz = data.cz;
+    return mesh;
+  }
+
+  /**
+   * Build InstancedMesh decorations for a chunk.
+   */
+  _buildDecorationMeshes(data) {
+    const result = [];
+
+    // Group decorations by type
+    const groups = {};
+    for (const dec of data.decorations) {
+      const key = `${dec.type}_${dec.subType || ""}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(dec);
+    }
+
+    for (const [key, decs] of Object.entries(groups)) {
+      if (decs.length === 0) continue;
+      const first = decs[0];
+
+      if (first.type === "tree") {
+        const cfg = TREE_CONFIGS[first.subType] || TREE_CONFIGS.oak;
+
+        // Trunk instances
+        const trunkGeo = new THREE.CylinderGeometry(cfg.trunkR * 0.7, cfg.trunkR, cfg.trunkH, 6);
+        const trunkMat = new THREE.MeshLambertMaterial({ color: cfg.trunkColor });
+        const trunkMesh = new THREE.InstancedMesh(trunkGeo, trunkMat, decs.length);
+        trunkMesh.castShadow = true;
+
+        const dummy = new THREE.Object3D();
+        for (let i = 0; i < decs.length; i++) {
+          const d = decs[i];
+          dummy.position.set(d.x, d.h + cfg.trunkH / 2, d.z);
+          dummy.rotation.y = d.ry;
+          dummy.updateMatrix();
+          trunkMesh.setMatrixAt(i, dummy.matrix);
+        }
+        trunkMesh.instanceMatrix.needsUpdate = true;
+        result.push(trunkMesh);
+
+        // Canopy instances (if tree has canopy)
+        if (cfg.canopyR > 0) {
+          const canopyGeo = new THREE.SphereGeometry(cfg.canopyR, 6, 5);
+          const canopyMat = new THREE.MeshLambertMaterial({ color: cfg.canopyColor });
+          const canopyMesh = new THREE.InstancedMesh(canopyGeo, canopyMat, decs.length);
+          canopyMesh.castShadow = true;
+
+          for (let i = 0; i < decs.length; i++) {
+            const d = decs[i];
+            dummy.position.set(d.x, d.h + cfg.trunkH + cfg.canopyH * 0.4, d.z);
+            dummy.scale.set(1, cfg.canopyH / cfg.canopyR / 2, 1);
+            dummy.rotation.set(0, d.ry, 0);
+            dummy.updateMatrix();
+            canopyMesh.setMatrixAt(i, dummy.matrix);
+          }
+          canopyMesh.instanceMatrix.needsUpdate = true;
+          result.push(canopyMesh);
+        }
+      } else if (first.type === "rock") {
+        const mat = new THREE.MeshLambertMaterial({ color: ROCK_COLORS[0] });
+        const mesh = new THREE.InstancedMesh(this._rockGeo, mat, decs.length);
+        mesh.castShadow = true;
+
+        const dummy = new THREE.Object3D();
+        for (let i = 0; i < decs.length; i++) {
+          const d = decs[i];
+          const s = 0.7 + (d.ry / (Math.PI * 2)) * 0.6;
+          dummy.position.set(d.x, d.h + s * 0.3, d.z);
+          dummy.scale.set(s, s * 0.7, s);
+          dummy.rotation.set(0, d.ry, 0);
+          dummy.updateMatrix();
+          mesh.setMatrixAt(i, dummy.matrix);
+        }
+        mesh.instanceMatrix.needsUpdate = true;
+        result.push(mesh);
+      } else if (first.type === "bush") {
+        const mat = new THREE.MeshLambertMaterial({ color: 0x388e3c });
+        const mesh = new THREE.InstancedMesh(this._bushGeo, mat, decs.length);
+        mesh.castShadow = true;
+
+        const dummy = new THREE.Object3D();
+        for (let i = 0; i < decs.length; i++) {
+          const d = decs[i];
+          dummy.position.set(d.x, d.h + 0.3, d.z);
+          dummy.scale.set(1, 0.7, 1);
+          dummy.updateMatrix();
+          mesh.setMatrixAt(i, dummy.matrix);
+        }
+        mesh.instanceMatrix.needsUpdate = true;
+        result.push(mesh);
+      } else if (first.type === "flower") {
+        const colors = [0xff69b4, 0xffeb3b, 0xe91e63, 0x9c27b0, 0xff5722];
+        const mat = new THREE.MeshBasicMaterial({ color: colors[0] });
+        const mesh = new THREE.InstancedMesh(this._flowerGeo, mat, decs.length);
+
+        const dummy = new THREE.Object3D();
+        for (let i = 0; i < decs.length; i++) {
+          const d = decs[i];
+          dummy.position.set(d.x, d.h + 0.15, d.z);
+          dummy.rotation.set(0, d.ry, 0);
+          dummy.updateMatrix();
+          mesh.setMatrixAt(i, dummy.matrix);
+        }
+        mesh.instanceMatrix.needsUpdate = true;
+        result.push(mesh);
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Unload a chunk and dispose its GPU resources.
+   */
+  _unloadChunk(chunk) {
+    if (!chunk || !chunk.meshes) return;
+    for (const mesh of chunk.meshes) {
+      this.scene.remove(mesh);
+      mesh.traverse((child) => {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) {
+          if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+          else child.material.dispose();
+        }
+      });
+    }
+  }
+
+  /**
+   * Dispose all chunks.
+   */
+  dispose() {
+    for (const [, chunk] of this.chunks) {
+      this._unloadChunk(chunk);
+    }
+    this.chunks.clear();
+  }
+
+  /**
+   * Get the heightmap at a world position (from loaded chunk).
+   */
+  getHeight(wx, wz) {
+    const cx = Math.floor(wx / CHUNK_SIZE);
+    const cz = Math.floor(wz / CHUNK_SIZE);
+    const key = `${cx},${cz}`;
+    const chunk = this.chunks.get(key);
+    if (!chunk || !chunk.data) return 0;
+
+    const lx = ((wx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+    const lz = ((wz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+    return chunk.data.heightmap[Math.floor(lz)]?.[Math.floor(lx)] ?? 0;
+  }
+
+  /**
+   * Get collision circles for loaded chunks near a position.
+   */
+  getCollisionCircles(wx, wz, radius) {
+    const circles = [];
+    const minCx = Math.floor((wx - radius) / CHUNK_SIZE);
+    const maxCx = Math.floor((wx + radius) / CHUNK_SIZE);
+    const minCz = Math.floor((wz - radius) / CHUNK_SIZE);
+    const maxCz = Math.floor((wz + radius) / CHUNK_SIZE);
+
+    for (let cz = minCz; cz <= maxCz; cz++) {
+      for (let cx = minCx; cx <= maxCx; cx++) {
+        const chunk = this.chunks.get(`${cx},${cz}`);
+        if (chunk?.data) {
+          circles.push(...chunk.data.collisionCircles);
+        }
+      }
+    }
+    return circles;
+  }
+
+  /**
+   * Get loaded chunk count.
+   */
+  get loadedChunkCount() {
+    return this.chunks.size;
+  }
+}

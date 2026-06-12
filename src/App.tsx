@@ -9,6 +9,9 @@ import { createClient, type SupabaseClient, type User, type Session } from '@sup
 
 import characterTextureUrl from './assets/character.png';
 import { TerrainBuilder } from './TerrainBuilder';
+import { ChunkManager } from './ChunkManager';
+import { MapEditor } from './MapEditor';
+import { DebugUI } from './DebugUI';
 
 // Initialize Supabase Client
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
@@ -44,11 +47,13 @@ export default function App() {
   const sceneRef = useRef<THREE.Scene | null>(null);
   const playersRef = useRef<Map<string, THREE.Group>>(new Map());
   const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
-  const groundRef = useRef<THREE.Mesh | null>(null);
 
   // Procedural terrain state
   const terrainBuilderRef = useRef<TerrainBuilder | null>(null);
+  const chunkManagerRef = useRef<ChunkManager | null>(null);
+  const mapEditorRef = useRef<MapEditor | null>(null);
   const mapDataRef = useRef<any>(null);
+  const debugUIRef = useRef<DebugUI | null>(null);
 
   // Sync state refs
   const playersDataRef = useRef<Map<string, { x: number, z: number, name?: string }>>(new Map());
@@ -123,6 +128,11 @@ export default function App() {
       } else if (msg.type === 'map_change') {
         // Server sent new map data after portal transition
         localPlayerId.current = msg.player.id;
+        // Dispose old terrain before loading new map
+        if (terrainBuilderRef.current) {
+          terrainBuilderRef.current.dispose();
+          terrainBuilderRef.current = null;
+        }
         mapDataRef.current = msg.map;
         // Clear all existing player sprites (they'll be re-created from moved msgs)
         playersDataRef.current.clear();
@@ -130,10 +140,9 @@ export default function App() {
           sceneRef.current?.remove(group);
         });
         playersRef.current.clear();
-        // Set joined to false then true to trigger scene rebuild
+        // Toggle joined to trigger scene rebuild via useEffect
         setJoined(false);
         requestAnimationFrame(() => {
-          mapDataRef.current = msg.map;
           setJoined(true);
         });
       } else if (msg.type === 'error') {
@@ -233,6 +242,14 @@ export default function App() {
   const handleLeaveGame = () => {
     ws.current?.close();
     setJoined(false);
+    if (chunkManagerRef.current) {
+      chunkManagerRef.current.dispose();
+      chunkManagerRef.current = null;
+    }
+    if (mapEditorRef.current) {
+      mapEditorRef.current.dispose();
+      mapEditorRef.current = null;
+    }
     if (terrainBuilderRef.current) {
       terrainBuilderRef.current.dispose();
       terrainBuilderRef.current = null;
@@ -273,11 +290,10 @@ export default function App() {
   const updatePlayerPosition = (id: string, gridX: number, gridZ: number, name?: string) => {
     if (!sceneRef.current || !charSpriteMaterial.current) return;
 
-    const mapData = mapDataRef.current;
-    const cellSize = mapData?.config?.cellSize || 5;
-    const worldX = (gridX + 0.5) * cellSize;
-    const worldZ = (gridZ + 0.5) * cellSize;
-    const terrainH = terrainBuilderRef.current?.getHeight(gridX, gridZ) ?? 0;
+    // New terrain: grid coordinates = world coordinates (1 unit per cell)
+    const worldX = gridX;
+    const worldZ = gridZ;
+    const terrainH = chunkManagerRef.current?.getHeight(gridX, gridZ) ?? 0;
 
     let playerGroup = playersRef.current.get(id);
     if (!playerGroup) {
@@ -298,11 +314,10 @@ export default function App() {
 
     playerGroup.position.set(worldX, terrainH, worldZ);
 
-    // Camera follow local player (isometric angle, adjusted for terrain)
+    // Camera follow local player (isometric angle)
     if (id === localPlayerId.current && cameraRef.current) {
-      const cs = mapData?.config?.cellSize || 5;
-      const viewSize = Math.max(mapData?.config?.width || 40, mapData?.config?.height || 40) * cs * 0.35;
-      cameraRef.current.position.set(worldX + viewSize * 0.7, terrainH + viewSize * 0.7, worldZ + viewSize * 0.7);
+      const camOffset = 35;
+      cameraRef.current.position.set(worldX + camOffset, terrainH + camOffset, worldZ + camOffset);
       cameraRef.current.lookAt(worldX, terrainH, worldZ);
     }
   };
@@ -320,63 +335,62 @@ export default function App() {
   useEffect(() => {
     if (!joined || !mountRef.current || !mapDataRef.current) return;
     const mapData = mapDataRef.current;
-    const { config, obstacleMap, heightMap } = mapData;
+    const { config } = mapData;
 
     // 1. Scene
     const scene = new THREE.Scene();
     sceneRef.current = scene;
-    scene.background = new THREE.Color(config.type === 'dungeon' ? 0x0a0a1a : 0x87ceeb);
+    scene.background = new THREE.Color(0x87ceeb);
 
-    // 2. Lighting
-    scene.add(new THREE.AmbientLight(0xffffff, config.type === 'dungeon' ? 0.3 : 0.6));
-    const dirLight = new THREE.DirectionalLight(0xffffff, config.type === 'dungeon' ? 0.4 : 0.8);
-    dirLight.position.set(50, 80, 50);
-    scene.add(dirLight);
+    // Fog for atmosphere on large world
+    scene.fog = new THREE.Fog(0x87ceeb, 60, 150);
 
-    // Dungeon: add point lights for atmosphere
-    if (config.type === 'dungeon') {
-      const pointLight = new THREE.PointLight(0xff8844, 0.6, 30);
-      pointLight.position.set(config.width * config.cellSize * 0.5, config.cellSize * 0.6, config.height * config.cellSize * 0.5);
-      scene.add(pointLight);
-    }
+    // 2. Lighting – TerrainBuilder handles its own lighting, just add a basic ambient
+    // (TerrainBuilder will add hemisphere + directional + ambient)
 
-    // 3. Camera
+    // 3. Camera – orthographic for 2.5D Ragnarok style
     const width = mountRef.current.clientWidth;
     const height = mountRef.current.clientHeight;
     const aspect = width / height;
-    const totalSize = Math.max(config.width, config.height) * config.cellSize;
-    const viewSize = totalSize * 0.35;
+    const viewSize = 45; // Shows ~45 units of the 200-unit world (closer view)
     const camera = new THREE.OrthographicCamera(
       -viewSize * aspect / 2, viewSize * aspect / 2,
       viewSize / 2, -viewSize / 2,
-      0.1, 1000,
+      0.1, 500,
     );
     cameraRef.current = camera;
+    // Initial camera position: look at center of terrain from isometric angle
+    const centerH = mapData.heightmap?.[100]?.[100] ?? 0;
+    camera.position.set(100 + 40, centerH + 40, 100 + 40);
+    camera.lookAt(100, centerH, 100);
     scene.add(camera);
 
     // 4. Renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(width, height);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     mountRef.current.appendChild(renderer.domElement);
 
-    // 5. Build procedural terrain
-    const textureLoader = new THREE.TextureLoader();
-    const builder = new TerrainBuilder(scene, mapData, textureLoader);
-    builder.build();
-    terrainBuilderRef.current = builder;
+    // 5. Build procedural terrain (new chunk-based streaming system)
+    const seed = mapData.config?.seed || 42;
+    console.log('[Terrain] Initializing chunk system:', { seed });
+    const chunkManager = new ChunkManager(scene, seed);
+    // Load initial chunks around spawn
+    chunkManager.update(mapData.spawnPoint?.x || 100, mapData.spawnPoint?.z || 100);
+    chunkManagerRef.current = chunkManager;
+    console.log('[Terrain] Chunk system ready. Scene children:', scene.children.length);
 
-    // Store a reference to the ground mesh for raycasting
-    // The TerrainBuilder creates the ground internally; we find it by type
-    scene.traverse((child) => {
-      if (child instanceof THREE.Mesh && !groundRef.current) {
-        // The first large mesh is the ground
-        if (child.geometry instanceof THREE.PlaneGeometry) {
-          groundRef.current = child;
-        }
-      }
-    });
+    // 5b. Map Editor (E key toggle)
+    const mapEditor = new MapEditor(scene, camera, chunkManager);
+    mapEditorRef.current = mapEditor;
+
+    // 5c. Debug UI (Ctrl+D toggle)
+    const debugUI = new DebugUI({ scene, terrainData: mapData });
+    debugUIRef.current = debugUI;
 
     // 6. Character material
+    const textureLoader = new THREE.TextureLoader();
     const characterTexture = textureLoader.load(characterTextureUrl);
     characterTexture.magFilter = THREE.NearestFilter;
     characterTexture.minFilter = THREE.NearestFilter;
@@ -403,20 +417,31 @@ export default function App() {
 
       raycaster.setFromCamera(pointer, cameraRef.current);
 
-      // Intersect with all meshes in the scene to find ground hits
+      // Intersect with terrain meshes (InstancedMesh or Mesh with isTerrain)
       const intersects = raycaster.intersectObjects(scene.children, true);
       for (const hit of intersects) {
-        if (hit.object instanceof THREE.Mesh && hit.object.geometry instanceof THREE.PlaneGeometry) {
+        if (hit.object instanceof THREE.Mesh && hit.object.userData.isTerrain) {
           const { x, z } = hit.point;
-          const cellSize = config.cellSize || 5;
-          const gridX = Math.max(0, Math.min(config.width - 1, Math.floor(x / cellSize)));
-          const gridZ = Math.max(0, Math.min(config.height - 1, Math.floor(z / cellSize)));
+          // Use ChunkManager for height lookup
+          const gridX = Math.round(x);
+          const gridZ = Math.round(z);
           ws.current?.send(JSON.stringify({ type: 'move', x: gridX, z: gridZ }));
           break;
         }
       }
     };
     mountRef.current.addEventListener('click', handleClick);
+
+    // 8b. E key to toggle map editor
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === 'e' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+        if (mapEditorRef.current) {
+          mapEditorRef.current.toggle();
+        }
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
 
     // 9. Resize
     const handleResize = () => {
@@ -438,6 +463,14 @@ export default function App() {
     let animationId: number;
     function animate() {
       animationId = requestAnimationFrame(animate);
+
+      // Update chunk streaming based on local player position
+      const localPlayer = playersDataRef.current.get(localPlayerId.current || '');
+      if (localPlayer && chunkManagerRef.current) {
+        chunkManagerRef.current.update(localPlayer.x, localPlayer.z);
+      }
+
+      debugUI.update();
       renderer.render(scene, camera);
     }
     animate();
@@ -446,6 +479,17 @@ export default function App() {
       cancelAnimationFrame(animationId);
       window.removeEventListener('resize', handleResize);
       mountRef.current?.removeEventListener('click', handleClick);
+      document.removeEventListener('keydown', handleKeyDown);
+      debugUI.dispose();
+      debugUIRef.current = null;
+      if (chunkManagerRef.current) {
+        chunkManagerRef.current.dispose();
+        chunkManagerRef.current = null;
+      }
+      if (mapEditorRef.current) {
+        mapEditorRef.current.dispose();
+        mapEditorRef.current = null;
+      }
       if (terrainBuilderRef.current) {
         terrainBuilderRef.current.dispose();
         terrainBuilderRef.current = null;
@@ -453,7 +497,6 @@ export default function App() {
       if (mountRef.current && renderer.domElement.parentNode === mountRef.current) {
         mountRef.current.removeChild(renderer.domElement);
       }
-      groundRef.current = null;
     };
   }, [joined]);
 
@@ -560,7 +603,7 @@ export default function App() {
               </span>
             </p>
             <p className="text-slate-400 text-xs">
-              Mapa: <span className="text-emerald-400">{mapDataRef.current?.config?.type || 'field'}</span>
+              Mapa: <span className="text-emerald-400">{mapDataRef.current?.config?.size || 200}×{mapDataRef.current?.config?.size || 200}</span>
               {' · '}
               Seed: <span className="text-slate-300 font-mono">{mapDataRef.current?.config?.seed || '—'}</span>
             </p>
@@ -573,7 +616,7 @@ export default function App() {
               className="px-4 py-2 bg-slate-950/80 hover:bg-slate-800 border border-slate-800 text-xs font-bold rounded-xl transition-all">Volver a Selección</button>
           </div>
           <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-slate-950/70 backdrop-blur-sm border border-slate-800 px-6 py-2 rounded-full pointer-events-none select-none text-xs text-slate-300">
-            🖱️ <strong>Left Click</strong> on the ground to move. Walk onto the <span className="text-red-400 font-bold">red portal</span> to change maps.
+            🖱️ <strong>Left Click</strong> to move · <strong>E</strong> editor · <strong>Ctrl+D</strong> debug
           </div>
         </div>
       )}

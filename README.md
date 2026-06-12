@@ -1,6 +1,6 @@
 # Ragnarok Online 2.5D Clone (MVP) with Supabase Auth
 
-This is a 2.5D top-down MMORPG clone featuring Three.js frontend graphics (using 2D billboard sprite characters) and a Node.js WebSocket backend for real-time synchronized movement, collision detection, and user persistence integrated with **Supabase Auth**. The world is built with **procedural map generation** — no hardcoded layouts.
+This is a 2.5D top-down MMORPG clone featuring Three.js frontend graphics (using 2D billboard sprite characters) and a Node.js WebSocket backend for real-time synchronized movement, collision detection, and user persistence integrated with **Supabase Auth**. The world is built with **procedural continuous terrain generation** — no hardcoded layouts, no tile grids.
 
 ---
 
@@ -8,44 +8,52 @@ This is a 2.5D top-down MMORPG clone featuring Three.js frontend graphics (using
 - **Account Management**: Safe user sign-in/sign-up forms connected to Supabase Auth.
 - **Character Selection**: Create and manage multiple characters linked directly to your authenticated account.
 - **Real-time Sync**: Multi-client synchronization via WebSockets.
-- **Procedural Maps**: Deterministic seed-based terrain generation (field + dungeon) — server and client produce identical worlds from the same seed.
-- **Portal System**: Walk onto a red portal to transition between map types in real-time.
-- **Validations**: Server-side collision, slope, and boundary validation on every move.
+- **Continuous Terrain**: 200×200 vertex mesh with simplex noise heightmap — rolling hills, paths, and natural topography.
+- **3D Decorations**: Trees, rocks, bushes, benches, and lampposts placed deterministically on the terrain.
+- **Validations**: Server-side slope validation (45° max), decoration collision circles, and boundary checks.
 - **Fallback Mode**: Fully-functional **Mock Auth & Database** fallback mode when no `.env` keys are configured.
 
 ---
 
-## Procedural Map Generation
+## Procedural Terrain Generation
 
 ### How It Works
-Both the server (`backend/mapGenerator.js`) and the client (`src/TerrainBuilder.js`) share the same deterministic noise/PRNG algorithm. When the server generates a map from a seed, it sends the seed + map type to the client, which rebuilds the exact same terrain locally. This means:
+Both the server (`backend/terrainGenerator.js`) and the client (`src/TerrainBuilder.js`) share the same deterministic algorithms:
+- **Simplex noise** (`simplex-noise` library) for heightmap generation
+- **Mulberry32 PRNG** for decoration placement and path generation
+
+When the server generates terrain from a seed, it sends the seed to the client, which rebuilds the exact same terrain locally. This means:
 - Collision checks match visual positions
-- No geometry is sent over the wire — only a small seed + config
-- Map generation is computed once per unique seed and cached in memory
+- No geometry is sent over the wire — only a small seed
+- Terrain is computed once per unique seed and cached in memory
 
-### Map Types
+### Terrain Specs
+| Property | Value |
+|----------|-------|
+| Grid size | 200×200 vertices |
+| Cell spacing | 1 unit |
+| Total world size | 200×200 units |
+| Height range | [-2, 5] |
+| Noise frequency | Low (0.01–0.06) for smooth hills |
+| Max walkable slope | 45° |
 
-| Type | Algorithm | Grid Size | Cell Size | Description |
-|------|-----------|-----------|-----------|-------------|
-| `field` | Multi-octave value noise | 40×40 | 5 units | Rolling hills with trees (cones+cylinders), rocks, and border walls |
-| `dungeon` | BSP room-and-corridor | 30×30 | 10 units | Stone rooms connected by corridors, dark ceiling, point lighting |
+### Decorations
+| Type | Collision Radius | Description |
+|------|-----------------|-------------|
+| Tree | 1.2 | Brown trunk (cylinder) + green canopy (sphere) |
+| Rock | 0.8 | Grey dodecahedron |
+| Bush | 0.5 | Small green sphere |
+| Bench | 1.0 | Wooden seat + legs |
+| Lamppost | 0.4 | Metal pole + glowing head + point light |
+
+Decorations are placed deterministically using the seed, with minimum spacing of 3 units and avoidance of steep slopes and low areas.
+
+### Dirt Paths
+Generated using random walks (5 paths, 80 steps each). Path cells are 3 units wide and rendered with a brown dirt texture on the terrain mesh.
 
 ### Changing the Seed
-The default seed is `42` (field) and `43` (dungeon). To change:
+The default seed is `42`. To change:
 - In `server.ts`, modify `startSeed` in the join handler
-- Or pass different seeds through the `targetSeed` field in portal definitions
-
-### Adding New Map Types
-1. Add a `generateYourType(seed, width, height)` function in `backend/mapGenerator.js`
-2. Register it in the `generateMap()` switch statement
-3. Add a `_buildYourType()` method in `src/TerrainBuilder.js`
-4. Set the `config.type` field to match
-
-### Portal System
-Portals are defined in the map data as `{ x, z, targetMap, targetSeed }`. When a player steps on a portal cell, the server:
-1. Generates/retrieves the target map
-2. Sends a `map_change` message with the new map data
-3. Teleports the player to the target map's spawn point
 
 ---
 
@@ -54,18 +62,20 @@ Portals are defined in the map data as `{ x, z, targetMap, targetSeed }`. When a
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  Server (server.ts)                                     │
-│  ├── mapGenerator.js  ← shared noise/PRNG algorithms   │
-│  ├── Generates terrain from seed (cached in memory)     │
-│  ├── Validates movement against obstacleMap + heightMap │
-│  └── Detects portal collisions → map_change messages    │
+│  ├── terrainGenerator.js  ← simplex noise + PRNG        │
+│  ├── Generates 200×200 heightmap from seed              │
+│  ├── Places decorations with collision circles           │
+│  ├── Validates: slope + collision circles + bounds       │
+│  └── Caches terrain in memory per seed                   │
 └───────────────────────┬─────────────────────────────────┘
                         │ WebSocket (JSON)
 ┌───────────────────────▼─────────────────────────────────┐
 │  Client (src/App.tsx)                                   │
 │  ├── TerrainBuilder.js  ← same algorithms as server     │
-│  ├── Builds Three.js geometry from seed                 │
-│  ├── Field: displaced plane + tree/rock meshes           │
-│  ├── Dungeon: floor quads + wall blocks + ceiling        │
+│  ├── Builds BufferGeometry mesh (40k vertices)           │
+│  ├── Canvas texture (grass/dirt/stone by height/slope)   │
+│  ├── 3D decoration models (trees, rocks, etc.)           │
+│  ├── Hemisphere + directional lighting + shadows         │
 │  └── Character sprites positioned at terrain height      │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -74,12 +84,16 @@ Portals are defined in the map data as `{ x, z, targetMap, targetSeed }`. When a
 | Direction | Type | Payload |
 |-----------|------|---------|
 | C→S | `join` | `{ token, characterId }` |
-| C→S | `move` | `{ x, z }` |
-| S→C | `init` | `{ player, players, map }` — includes full map data |
+| C→S | `move` | `{ x, z }` — grid coordinates (0–199) |
+| S→C | `init` | `{ player, players, map }` — includes terrain data |
 | S→C | `moved` | `{ id, x, z, name? }` |
-| S→C | `map_change` | `{ player, map }` — after portal transition |
 | S→C | `left` | `{ id }` |
 | S→C | `error` | `{ message }` |
+
+### Move Validation (Server)
+1. **Bounds check**: x and z must be within [0, 199]
+2. **Slope check**: `atan2(heightDiff, horizontalDist)` must be ≤ 45°
+3. **Collision check**: Position must not be inside any decoration's bounding circle
 
 ---
 
@@ -87,7 +101,7 @@ Portals are defined in the map data as `{ x, z, targetMap, targetSeed }`. When a
 
 ### 1. Database Configuration (Supabase)
 1. Go to your Supabase Dashboard and open the **SQL Editor**.
-2. Copy the contents of [supabase-init.sql](file:///c:/Users/User/Desktop/bruno/MIS%20REPOS/LeemonEngine/supabase-init.sql) and run the script. This will:
+2. Copy the contents of `supabase-init.sql` and run the script. This will:
    - Create the `characters` table with a foreign key referencing `auth.users`.
    - Enable Row-Level Security (RLS).
    - Configure policies allowing authenticated users to **select**, **insert**, and **update** only their own characters.
@@ -98,7 +112,7 @@ Create a `.env` file in the project root containing:
 ```env
 # Backend Database Keys
 SUPABASE_URL="https://your-project-id.supabase.co"
-SUPABASE_KEY="your-supabase-service-role-key" # Keep it secure! Recommended: use service_role so the game server can update coordinates bypassing RLS.
+SUPABASE_KEY="your-supabase-service-role-key"
 
 # Frontend client-side variables (injected by Vite)
 VITE_SUPABASE_URL="https://your-project-id.supabase.co"
@@ -109,12 +123,8 @@ VITE_SUPABASE_ANON_KEY="your-supabase-anon-key"
 > If you leave these variables blank, the application will default to **Mock Auth Mode**. You can sign in using any mock email and create/test characters immediately!
 
 ### 3. Start the Server
-Run the following commands in the project root:
 ```bash
-# Install dependencies
 npm install
-
-# Start the dev server (Vite frontend + WebSocket backend)
 npm run dev
 ```
 
@@ -122,11 +132,36 @@ Open `http://localhost:3000` in your web browser.
 
 ---
 
-## Row-Level Security (RLS) Configuration
-To protect user data, Row-Level Security (RLS) restricts access to database records. In our setup, RLS policies are applied to the `characters` table:
+## Debug Tools
 
-- **SELECT Policy**: Only allows reading if `auth.uid() = user_id`. This means users can only see their own characters in the selection screen.
-- **INSERT Policy**: Only allows inserting characters where the `user_id` matches the user's authenticated UID (`auth.uid() = user_id`).
-- **UPDATE Policy**: Ensures players can only modify their own characters (`auth.uid() = user_id`).
+### DebugUI Panel (Ctrl+D)
+Press **Ctrl+D** in-game to toggle a floating debug panel with:
+- **Seed display** — view current seed, copy to clipboard
+- **Visual overlays** — toggle grid (10-unit), height gradient, collision circles
+- **FPS counter** and **object count**
 
-The WebSocket server verifies this authorization on connection by querying the database using the verified user ID from the Supabase client-side JWT token.
+### Overlays
+| Overlay | Color | What it shows |
+|---------|-------|---------------|
+| Grid | Blue 30% opacity | 10-unit grid lines |
+| Heights | Blue→Green→Yellow→Red | Height gradient (sampled every 4 units) |
+| Collisions | Red rings | Decoration collision circles |
+
+### Map Hash Endpoint
+```
+GET /api/map/hash?seed=42
+```
+Returns the MD5 hash of the heightmap for deterministic verification.
+
+### Consistency Test
+```bash
+node test_map_consistency.js
+```
+Runs 1074 tests verifying:
+- Deterministic generation (same seed → same heightmap)
+- Height values within range [-2, 5]
+- Decoration placement validity and spacing
+- Collision circle consistency
+- Slope validation logic
+- Spawn point and path validity
+- PRNG determinism

@@ -2,9 +2,17 @@ import express from "express";
 import { WebSocketServer } from "ws";
 import { createServer as createViteServer } from "vite";
 import path from "path";
+import crypto from "crypto";
 import dotenv from "dotenv";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { generateMap } from "./backend/mapGenerator.js";
+import {
+  generateTerrain,
+  generateHeightmap,
+  TERRAIN_SIZE,
+  MAX_SLOPE_DEG,
+} from "./backend/terrainGenerator.js";
+import { Quadtree, buildQuadtree } from "./backend/Quadtree.js";
+import { createMapModificationsRouter } from "./backend/routes/mapModifications.js";
 
 dotenv.config();
 
@@ -16,7 +24,8 @@ let supabase: SupabaseClient | null = null;
 let useMockDb = false;
 
 const mockDb = {
-  characters: new Map<string, { id: string; user_id: string; name: string; pos_x: number; pos_z: number }>()
+  characters: new Map<string, { id: string; user_id: string; name: string; pos_x: number; pos_z: number }>(),
+  modifications: [] as any[],
 };
 
 if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
@@ -34,21 +43,25 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
 
 // ─── Active Maps ────────────────────────────────────────────────────────────
 // Each map instance is keyed by its seed so that multiple maps can coexist.
-// The obstacle/height data is generated once and reused for every player on
-// that map, keeping CPU usage low even with many connections.
+// The terrain data is generated once and reused for every player on that map.
 interface MapInstance {
   seed: number;
-  type: string;
-  data: ReturnType<typeof generateMap>;
+  data: ReturnType<typeof generateTerrain>;
+  quadtree: Quadtree;
 }
 const activeMaps = new Map<number, MapInstance>();
 
-function getOrGenerateMap(seed: number, type: string): MapInstance {
+function getOrGenerateMap(seed: number): MapInstance {
   if (activeMaps.has(seed)) return activeMaps.get(seed)!;
-  const data = generateMap(seed, type as "field" | "dungeon");
-  const instance: MapInstance = { seed, type, data };
+  const data = generateTerrain(seed);
+
+  // Build quadtree for efficient collision queries
+  const bounds = { x: 0, z: 0, width: data.config.size, height: data.config.size };
+  const quadtree = buildQuadtree(data.collisionCircles, bounds);
+
+  const instance: MapInstance = { seed, data, quadtree };
   activeMaps.set(seed, instance);
-  console.log(`Generated map: seed=${seed} type=${type} ${data.config.width}x${data.config.height}`);
+  console.log(`Generated terrain: seed=${seed} ${data.config.size}x${data.config.size} (${data.collisionCircles.length} collision objects in quadtree)`);
   return instance;
 }
 
@@ -60,16 +73,50 @@ interface Player {
   z: number;
   socketId: any;
   mapSeed: number;
-  mapType: string;
 }
 let players: Map<any, Player> = new Map();
 
-// ─── Maximum slope the player can walk up (in height units per cell) ────────
-const MAX_SLOPE = 1.5;
-
 // ─── Start Server ───────────────────────────────────────────────────────────
 async function startServer() {
+  app.use(express.json());
   app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
+
+  // ── Map modifications routes (designer overrides) ──────────────────────
+  app.use("/api/modifications", createMapModificationsRouter(supabase, useMockDb, mockDb));
+
+  // ── Map hash endpoint ────────────────────────────────────────────────────
+  // Returns an MD5 hash of the heightmap for deterministic verification.
+  app.get("/api/map/hash", (req, res) => {
+    const seed = parseInt(req.query.seed as string, 10) || 42;
+    const terrain = generateTerrain(seed);
+    const heightStr = terrain.heightmap.map((row: number[]) => row.join(",")).join(";");
+    const hash = crypto.createHash("md5").update(heightStr).digest("hex");
+
+    res.json({
+      seed,
+      hash,
+      size: terrain.config.size,
+      spawnPoint: terrain.spawnPoint,
+      decorationCount: terrain.decorations.length,
+    });
+  });
+
+  // Legacy validate endpoint (redirects to hash)
+  app.get("/api/map/validate", (req, res) => {
+    const seed = parseInt(req.query.seed as string, 10) || 42;
+    const terrain = generateTerrain(seed);
+    const heightStr = terrain.heightmap.map((row: number[]) => row.join(",")).join(";");
+    const hash = crypto.createHash("md5").update(heightStr).digest("hex");
+
+    res.json({
+      seed,
+      type: "field",
+      hash,
+      config: terrain.config,
+      spawnPoints: [terrain.spawnPoint],
+      gridSize: { w: terrain.config.size, h: terrain.config.size },
+    });
+  });
 
   if (process.env.NODE_ENV === "production") {
     app.use(express.static(path.join(process.cwd(), "dist")));
@@ -114,8 +161,8 @@ async function startServer() {
               id: characterId,
               user_id: userId,
               name: characterId ? `Novice ${characterId.substring(0, 5)}` : "Novice Player",
-              pos_x: 2,
-              pos_z: 2
+              pos_x: 100,
+              pos_z: 100
             });
           }
           const char = mockDb.characters.get(characterId);
@@ -148,30 +195,33 @@ async function startServer() {
           }
         }
 
-        // Determine starting map (use field by default)
+        // Determine starting map
         const startSeed = 42;
-        const startType = "field";
-        const mapInstance = getOrGenerateMap(startSeed, startType);
-        const { obstacleMap, heightMap, spawnPoints } = mapInstance.data;
-        const spawn = spawnPoints[0] || { x: 2, z: 2 };
+        const mapInstance = getOrGenerateMap(startSeed);
+        const { spawnPoint } = mapInstance.data;
+
+        // New characters (pos_x=2, pos_z=2) start at spawn point
+        // Returning characters use their saved position
+        const isNewCharacter = (charData.pos_x === 2 && charData.pos_z === 2);
+        const startX = isNewCharacter ? spawnPoint.x : (charData.pos_x ?? spawnPoint.x);
+        const startZ = isNewCharacter ? spawnPoint.z : (charData.pos_z ?? spawnPoint.z);
 
         const player: Player = {
           id: charData.id,
           name: charData.name,
-          x: charData.pos_x ?? spawn.x,
-          z: charData.pos_z ?? spawn.z,
+          x: startX,
+          z: startZ,
           socketId: ws,
           mapSeed: startSeed,
-          mapType: startType,
         };
         players.set(ws, player);
 
         // Build serialisable player list (exclude socketId)
         const serializedPlayers = Array.from(players.values())
-          .filter((p) => p.mapSeed === player.mapSeed) // Only players on the same map
+          .filter((p) => p.mapSeed === player.mapSeed)
           .map((p) => ({ id: p.id, name: p.name, x: p.x, z: p.z }));
 
-        // Send init with map data so the client can build the terrain
+        // Send init with terrain data so the client can build the world
         ws.send(JSON.stringify({
           type: "init",
           player: { id: player.id, name: player.name, x: player.x, z: player.z },
@@ -202,57 +252,34 @@ async function startServer() {
         const mapInstance = activeMaps.get(player.mapSeed);
         if (!mapInstance) return;
 
-        const { obstacleMap, heightMap, config } = mapInstance.data;
-        const { width, height } = config;
+        const { heightmap, config } = mapInstance.data;
+        const size = config.size;
 
         // 1. Bounds check
-        if (x < 0 || x >= width || z < 0 || z >= height) return;
+        if (x < 0 || x >= size || z < 0 || z >= size) return;
 
-        // 2. Obstacle check (0 = walkable)
-        if (obstacleMap[z]?.[x] !== 0) return;
+        // 2. Slope check – prevent walking up impossibly steep terrain
+        const currentH = heightmap[player.z]?.[player.x] ?? 0;
+        const targetH = heightmap[z]?.[x] ?? 0;
+        const heightDiff = Math.abs(targetH - currentH);
+        const dx = Math.abs(x - player.x);
+        const dz = Math.abs(z - player.z);
+        const horizDist = (dx > 0 && dz > 0)
+          ? config.cellSize * Math.SQRT2
+          : config.cellSize;
+        const slopeDeg = Math.atan2(heightDiff, horizDist) * (180 / Math.PI);
+        if (slopeDeg > MAX_SLOPE_DEG) return;
 
-        // 3. Slope check – prevent walking up impossibly steep terrain
-        const currentH = heightMap[player.z]?.[player.x] ?? 0;
-        const targetH = heightMap[z]?.[x] ?? 0;
-        if (Math.abs(targetH - currentH) > MAX_SLOPE) return;
-
-        // 4. Portal check – if the target cell has a portal, trigger map change
-        const portal = mapInstance.data.portals.find(
-          (p: any) => p.x === x && p.z === z,
-        );
-        if (portal) {
-          const targetMap = getOrGenerateMap(portal.targetSeed, portal.targetMap);
-          const targetSpawn = targetMap.data.spawnPoints[0] || { x: 2, z: 2 };
-
-          player.mapSeed = portal.targetSeed;
-          player.mapType = portal.targetMap;
-          player.x = targetSpawn.x;
-          player.z = targetSpawn.z;
-
-          players.set(ws, player);
-
-          // Send map_change to the player with the new map data
-          ws.send(JSON.stringify({
-            type: "map_change",
-            player: { id: player.id, name: player.name, x: player.x, z: player.z },
-            map: targetMap.data,
-          }));
-
-          // Re-send all players on the new map as moved messages
-          const playersOnMap = Array.from(players.values())
-            .filter((p) => p.mapSeed === player.mapSeed && p.id !== player.id);
-          for (const p of playersOnMap) {
-            ws.send(JSON.stringify({
-              type: "moved", id: p.id, name: p.name, x: p.x, z: p.z,
-            }));
-          }
-
-          // Persist position
-          persistPosition(player);
-          return;
+        // 3. Decoration collision check via quadtree (O(log n) instead of O(n))
+        const nearby = mapInstance.quadtree.queryRadius(x, z, 3);
+        for (const circle of nearby) {
+          const cdx = x - circle.x;
+          const cdz = z - circle.z;
+          const dist = Math.sqrt(cdx * cdx + cdz * cdz);
+          if (dist < circle.radius) return;
         }
 
-        // 5. Apply movement
+        // 4. Apply movement
         player.x = x;
         player.z = z;
         players.set(ws, player);
