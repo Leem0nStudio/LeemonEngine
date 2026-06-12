@@ -3,133 +3,579 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
+import { createClient, type SupabaseClient, type User, type Session } from '@supabase/supabase-js';
+
+import characterTextureUrl from './assets/character.png';
+import { TerrainBuilder } from './TerrainBuilder';
+
+// Initialize Supabase Client
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+const isMockAuth = !supabaseUrl || !supabaseAnonKey;
+let supabase: SupabaseClient | null = null;
+if (!isMockAuth) {
+  supabase = createClient(supabaseUrl, supabaseAnonKey);
+}
 
 export default function App() {
   const mountRef = useRef<HTMLDivElement>(null);
+
+  // Auth state
+  const [user, setUser] = useState<User | { id: string; email: string } | null>(null);
+  const [sessionToken, setSessionToken] = useState<string>('');
+  const [characters, setCharacters] = useState<{ id: string; name: string; pos_x?: number; pos_z?: number }[]>([]);
+  const [newCharacterName, setNewCharacterName] = useState<string>('');
+
+  // Login / Signup Form State
+  const [isLoginView, setIsLoginView] = useState(true);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+
+  // Game & Networking State
   const [status, setStatus] = useState('Disconnected');
   const [joined, setJoined] = useState(false);
   const [characterId, setCharacterId] = useState('');
+  const [errorMessage, setErrorMessage] = useState('');
   const ws = useRef<WebSocket | null>(null);
 
   // THREE.js state
   const sceneRef = useRef<THREE.Scene | null>(null);
-  const playersRef = useRef<Map<string, THREE.Mesh>>(new Map());
+  const playersRef = useRef<Map<string, THREE.Group>>(new Map());
   const cameraRef = useRef<THREE.OrthographicCamera | null>(null);
   const groundRef = useRef<THREE.Mesh | null>(null);
 
+  // Procedural terrain state
+  const terrainBuilderRef = useRef<TerrainBuilder | null>(null);
+  const mapDataRef = useRef<any>(null);
+
+  // Sync state refs
+  const playersDataRef = useRef<Map<string, { x: number, z: number, name?: string }>>(new Map());
+  const charSpriteMaterial = useRef<THREE.SpriteMaterial | null>(null);
+  const localPlayerId = useRef<string | null>(null);
+
+  // ── Supabase / Mock Auth Session Loader ──
   useEffect(() => {
-    ws.current = new WebSocket(`ws://${window.location.host}`);
-    ws.current.onopen = () => setStatus('Connected');
-    ws.current.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'init') {
-            setJoined(true);
-            // Render initial players ...
-        } else if (msg.type === 'moved') {
-            updatePlayerPosition(msg.id, msg.x, msg.z);
+    if (isMockAuth) {
+      const savedUser = localStorage.getItem('mock_user');
+      if (savedUser) {
+        const parsedUser = JSON.parse(savedUser);
+        setUser(parsedUser);
+        setSessionToken(parsedUser.id);
+        fetchMockCharacters(parsedUser.id);
+      }
+    } else {
+      supabase!.auth.getSession().then(({ data: { session } }: { data: { session: Session | null } }) => {
+        if (session) {
+          setUser(session.user);
+          setSessionToken(session.access_token);
+          fetchRealCharacters(session.user.id);
         }
-    };
-    ws.current.onclose = () => setStatus('Disconnected');
-    return () => { ws.current?.close(); };
+      });
+      const { data: { subscription } } = supabase!.auth.onAuthStateChange((_event: string, session: Session | null) => {
+        if (session) {
+          setUser(session.user);
+          setSessionToken(session.access_token);
+          fetchRealCharacters(session.user.id);
+        } else {
+          setUser(null);
+          setSessionToken('');
+          setCharacters([]);
+          setJoined(false);
+        }
+      });
+      return () => { subscription.unsubscribe(); };
+    }
   }, []);
 
-  const updatePlayerPosition = (id: string, x: number, z: number) => {
-    if (!sceneRef.current) return;
-    let mesh = playersRef.current.get(id);
-    if (!mesh) {
-        mesh = new THREE.Mesh(
-            new THREE.SphereGeometry(0.5),
-            new THREE.MeshBasicMaterial({ color: Math.random() * 0xffffff })
-        );
-        sceneRef.current.add(mesh);
-        playersRef.current.set(id, mesh);
-    }
-    mesh.position.set(x, 1, z);
+  // ── WebSocket Setup ──
+  const connectWebSocket = (charId: string, token: string) => {
+    if (ws.current) ws.current.close();
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(`${protocol}//${window.location.host}`);
+    ws.current = socket;
+
+    socket.onopen = () => {
+      setStatus('Connected');
+      socket.send(JSON.stringify({ type: 'join', token, characterId: charId }));
+    };
+
+    socket.onmessage = (event) => {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (e) { return; }
+
+      if (msg.type === 'init') {
+        localPlayerId.current = msg.player.id;
+        playersDataRef.current.clear();
+        msg.players.forEach((p: { id: string; x: number; z: number; name?: string }) => {
+          playersDataRef.current.set(p.id, { x: p.x, z: p.z, name: p.name });
+        });
+        // Store map data for terrain building
+        mapDataRef.current = msg.map;
+        setJoined(true);
+        setErrorMessage('');
+      } else if (msg.type === 'moved') {
+        playersDataRef.current.set(msg.id, { x: msg.x, z: msg.z, name: msg.name });
+        updatePlayerPosition(msg.id, msg.x, msg.z, msg.name);
+      } else if (msg.type === 'left') {
+        removePlayer(msg.id);
+      } else if (msg.type === 'map_change') {
+        // Server sent new map data after portal transition
+        localPlayerId.current = msg.player.id;
+        mapDataRef.current = msg.map;
+        // Clear all existing player sprites (they'll be re-created from moved msgs)
+        playersDataRef.current.clear();
+        playersRef.current.forEach((group) => {
+          sceneRef.current?.remove(group);
+        });
+        playersRef.current.clear();
+        // Set joined to false then true to trigger scene rebuild
+        setJoined(false);
+        requestAnimationFrame(() => {
+          mapDataRef.current = msg.map;
+          setJoined(true);
+        });
+      } else if (msg.type === 'error') {
+        setErrorMessage(msg.message);
+        setJoined(false);
+        ws.current?.close();
+      }
+    };
+
+    socket.onclose = () => setStatus('Disconnected');
   };
 
-  useEffect(() => {
-    if (!joined || !mountRef.current) return;
+  // ── Characters Fetch Helpers ──
+  const fetchMockCharacters = (userId: string) => {
+    const charsKey = `mock_chars_${userId}`;
+    const chars = localStorage.getItem(charsKey);
+    if (chars) {
+      setCharacters(JSON.parse(chars));
+    } else {
+      const defaultChar = { id: 'demo-char-id', name: 'Novice Player', pos_x: 2, pos_z: 2 };
+      setCharacters([defaultChar]);
+      localStorage.setItem(charsKey, JSON.stringify([defaultChar]));
+    }
+  };
 
+  const fetchRealCharacters = async (userId: string) => {
+    try {
+      const { data, error } = await supabase!.from('characters').select('*').eq('user_id', userId);
+      if (error) console.error("Error fetching characters:", error);
+      else setCharacters(data || []);
+    } catch (e) { console.error("Fetch exception:", e); }
+  };
+
+  // ── Auth Handlers ──
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setErrorMessage('');
+    if (!email.trim() || !password.trim()) { setErrorMessage("Please fill all fields"); return; }
+
+    if (isMockAuth) {
+      const userId = `mock-user-${email.split('@')[0]}`;
+      const mockUserObj = { id: userId, email };
+      localStorage.setItem('mock_user', JSON.stringify(mockUserObj));
+      setUser(mockUserObj);
+      setSessionToken(userId);
+      fetchMockCharacters(userId);
+    } else {
+      if (isLoginView) {
+        const { error } = await supabase!.auth.signInWithPassword({ email, password });
+        if (error) setErrorMessage(error.message);
+      } else {
+        const { error } = await supabase!.auth.signUp({ email, password });
+        if (error) setErrorMessage(error.message);
+        else alert("Verification email sent if email confirmation is enabled!");
+      }
+    }
+  };
+
+  const handleSignOut = async () => {
+    ws.current?.close();
+    setJoined(false);
+    if (isMockAuth) {
+      localStorage.removeItem('mock_user');
+      setUser(null);
+      setSessionToken('');
+      setCharacters([]);
+    } else {
+      await supabase!.auth.signOut();
+    }
+  };
+
+  // ── Character Creation ──
+  const handleCreateCharacter = async () => {
+    if (!newCharacterName.trim() || !user) return;
+    setErrorMessage('');
+
+    if (isMockAuth) {
+      const newChar = { id: `char-${Date.now()}`, name: newCharacterName, pos_x: 2, pos_z: 2 };
+      const updated = [...characters, newChar];
+      setCharacters(updated);
+      localStorage.setItem(`mock_chars_${user.id}`, JSON.stringify(updated));
+      setNewCharacterName('');
+    } else {
+      const { data, error } = await supabase!.from('characters')
+        .insert({ user_id: user.id, name: newCharacterName, pos_x: 2, pos_z: 2 })
+        .select().single();
+      if (error) setErrorMessage(error.message);
+      else { setCharacters([...characters, data]); setNewCharacterName(''); }
+    }
+  };
+
+  const handleSelectCharacter = (charId: string) => {
+    setCharacterId(charId);
+    connectWebSocket(charId, sessionToken);
+  };
+
+  const handleLeaveGame = () => {
+    ws.current?.close();
+    setJoined(false);
+    if (terrainBuilderRef.current) {
+      terrainBuilderRef.current.dispose();
+      terrainBuilderRef.current = null;
+    }
+    playersRef.current.forEach((group) => sceneRef.current?.remove(group));
+    playersRef.current.clear();
+    playersDataRef.current.clear();
+  };
+
+  // ── Three.js Helpers ──
+  const createNameLabel = (name: string) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.6)';
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(10, 10, 236, 44, 12);
+      else ctx.rect(10, 10, 236, 44);
+      ctx.fill();
+      ctx.strokeStyle = '#38bdf8';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.font = 'bold 20px Outfit, sans-serif';
+      ctx.fillStyle = '#f8fafc';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(name, 128, 32);
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+    const sprite = new THREE.Sprite(material);
+    sprite.scale.set(1.5, 0.375, 1);
+    return sprite;
+  };
+
+  const updatePlayerPosition = (id: string, gridX: number, gridZ: number, name?: string) => {
+    if (!sceneRef.current || !charSpriteMaterial.current) return;
+
+    const mapData = mapDataRef.current;
+    const cellSize = mapData?.config?.cellSize || 5;
+    const worldX = (gridX + 0.5) * cellSize;
+    const worldZ = (gridZ + 0.5) * cellSize;
+    const terrainH = terrainBuilderRef.current?.getHeight(gridX, gridZ) ?? 0;
+
+    let playerGroup = playersRef.current.get(id);
+    if (!playerGroup) {
+      playerGroup = new THREE.Group();
+      const sprite = new THREE.Sprite(charSpriteMaterial.current);
+      sprite.scale.set(1.2, 1.8, 1);
+      sprite.position.set(0, 0.9, 0);
+      playerGroup.add(sprite);
+
+      const displayName = id === localPlayerId.current ? "You" : (name || `Player ${id.substring(0, 4)}`);
+      const label = createNameLabel(displayName);
+      label.position.set(0, 2.0, 0);
+      playerGroup.add(label);
+
+      sceneRef.current.add(playerGroup);
+      playersRef.current.set(id, playerGroup);
+    }
+
+    playerGroup.position.set(worldX, terrainH, worldZ);
+
+    // Camera follow local player (isometric angle, adjusted for terrain)
+    if (id === localPlayerId.current && cameraRef.current) {
+      const cs = mapData?.config?.cellSize || 5;
+      const viewSize = Math.max(mapData?.config?.width || 40, mapData?.config?.height || 40) * cs * 0.35;
+      cameraRef.current.position.set(worldX + viewSize * 0.7, terrainH + viewSize * 0.7, worldZ + viewSize * 0.7);
+      cameraRef.current.lookAt(worldX, terrainH, worldZ);
+    }
+  };
+
+  const removePlayer = (id: string) => {
+    playersDataRef.current.delete(id);
+    const group = playersRef.current.get(id);
+    if (group) {
+      sceneRef.current?.remove(group);
+      playersRef.current.delete(id);
+    }
+  };
+
+  // ── Three.js Canvas Effect ──
+  useEffect(() => {
+    if (!joined || !mountRef.current || !mapDataRef.current) return;
+    const mapData = mapDataRef.current;
+    const { config, obstacleMap, heightMap } = mapData;
+
+    // 1. Scene
     const scene = new THREE.Scene();
     sceneRef.current = scene;
-    const camera = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 1000);
-    camera.position.set(10, 10, 10);
-    camera.lookAt(0, 0, 0);
-    cameraRef.current = camera;
+    scene.background = new THREE.Color(config.type === 'dungeon' ? 0x0a0a1a : 0x87ceeb);
 
+    // 2. Lighting
+    scene.add(new THREE.AmbientLight(0xffffff, config.type === 'dungeon' ? 0.3 : 0.6));
+    const dirLight = new THREE.DirectionalLight(0xffffff, config.type === 'dungeon' ? 0.4 : 0.8);
+    dirLight.position.set(50, 80, 50);
+    scene.add(dirLight);
+
+    // Dungeon: add point lights for atmosphere
+    if (config.type === 'dungeon') {
+      const pointLight = new THREE.PointLight(0xff8844, 0.6, 30);
+      pointLight.position.set(config.width * config.cellSize * 0.5, config.cellSize * 0.6, config.height * config.cellSize * 0.5);
+      scene.add(pointLight);
+    }
+
+    // 3. Camera
+    const width = mountRef.current.clientWidth;
+    const height = mountRef.current.clientHeight;
+    const aspect = width / height;
+    const totalSize = Math.max(config.width, config.height) * config.cellSize;
+    const viewSize = totalSize * 0.35;
+    const camera = new THREE.OrthographicCamera(
+      -viewSize * aspect / 2, viewSize * aspect / 2,
+      viewSize / 2, -viewSize / 2,
+      0.1, 1000,
+    );
+    cameraRef.current = camera;
+    scene.add(camera);
+
+    // 4. Renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setSize(mountRef.current.clientWidth, mountRef.current.clientHeight);
+    renderer.setSize(width, height);
     mountRef.current.appendChild(renderer.domElement);
 
-    const ground = new THREE.Mesh(
-        new THREE.PlaneGeometry(20, 20),
-        new THREE.MeshBasicMaterial({ color: 0x4a5568 })
-    );
-    ground.rotation.x = -Math.PI / 2;
-    groundRef.current = ground;
-    scene.add(ground);
+    // 5. Build procedural terrain
+    const textureLoader = new THREE.TextureLoader();
+    const builder = new TerrainBuilder(scene, mapData, textureLoader);
+    builder.build();
+    terrainBuilderRef.current = builder;
 
-    // Raycaster
+    // Store a reference to the ground mesh for raycasting
+    // The TerrainBuilder creates the ground internally; we find it by type
+    scene.traverse((child) => {
+      if (child instanceof THREE.Mesh && !groundRef.current) {
+        // The first large mesh is the ground
+        if (child.geometry instanceof THREE.PlaneGeometry) {
+          groundRef.current = child;
+        }
+      }
+    });
+
+    // 6. Character material
+    const characterTexture = textureLoader.load(characterTextureUrl);
+    characterTexture.magFilter = THREE.NearestFilter;
+    characterTexture.minFilter = THREE.NearestFilter;
+    charSpriteMaterial.current = new THREE.SpriteMaterial({
+      map: characterTexture,
+      transparent: true,
+      alphaTest: 0.1,
+    });
+
+    // 7. Render existing players
+    playersDataRef.current.forEach((pos, id) => {
+      updatePlayerPosition(id, pos.x, pos.z, pos.name);
+    });
+
+    // 8. Raycaster & click-to-move
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
 
     const handleClick = (event: MouseEvent) => {
-        if (!mountRef.current || !cameraRef.current || !groundRef.current) return;
-        const rect = mountRef.current.getBoundingClientRect();
-        pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-        pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-        
-        raycaster.setFromCamera(pointer, cameraRef.current);
-        const intersects = raycaster.intersectObject(groundRef.current);
-        if (intersects.length > 0) {
-            const { x, z } = intersects[0].point;
-            ws.current?.send(JSON.stringify({ type: 'move', x: Math.round(x), z: Math.round(z) }));
+      if (!mountRef.current || !cameraRef.current) return;
+      const rect = mountRef.current.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+      raycaster.setFromCamera(pointer, cameraRef.current);
+
+      // Intersect with all meshes in the scene to find ground hits
+      const intersects = raycaster.intersectObjects(scene.children, true);
+      for (const hit of intersects) {
+        if (hit.object instanceof THREE.Mesh && hit.object.geometry instanceof THREE.PlaneGeometry) {
+          const { x, z } = hit.point;
+          const cellSize = config.cellSize || 5;
+          const gridX = Math.max(0, Math.min(config.width - 1, Math.floor(x / cellSize)));
+          const gridZ = Math.max(0, Math.min(config.height - 1, Math.floor(z / cellSize)));
+          ws.current?.send(JSON.stringify({ type: 'move', x: gridX, z: gridZ }));
+          break;
         }
+      }
     };
     mountRef.current.addEventListener('click', handleClick);
 
+    // 9. Resize
+    const handleResize = () => {
+      if (!mountRef.current || !cameraRef.current) return;
+      const w = mountRef.current.clientWidth;
+      const h = mountRef.current.clientHeight;
+      const a = w / h;
+      const cam = cameraRef.current;
+      cam.left = -viewSize * a / 2;
+      cam.right = viewSize * a / 2;
+      cam.top = viewSize / 2;
+      cam.bottom = -viewSize / 2;
+      cam.updateProjectionMatrix();
+      renderer.setSize(w, h);
+    };
+    window.addEventListener('resize', handleResize);
+
+    // 10. Animation loop
+    let animationId: number;
     function animate() {
-      requestAnimationFrame(animate);
+      animationId = requestAnimationFrame(animate);
       renderer.render(scene, camera);
     }
     animate();
 
-    return () => { 
-        mountRef.current?.removeEventListener('click', handleClick);
-        if (mountRef.current && renderer.domElement.parentNode === mountRef.current) {
-            mountRef.current.removeChild(renderer.domElement);
-        }
+    return () => {
+      cancelAnimationFrame(animationId);
+      window.removeEventListener('resize', handleResize);
+      mountRef.current?.removeEventListener('click', handleClick);
+      if (terrainBuilderRef.current) {
+        terrainBuilderRef.current.dispose();
+        terrainBuilderRef.current = null;
+      }
+      if (mountRef.current && renderer.domElement.parentNode === mountRef.current) {
+        mountRef.current.removeChild(renderer.domElement);
+      }
+      groundRef.current = null;
     };
   }, [joined]);
 
-  const handleJoin = () => {
-    if (ws.current) {
-        ws.current.send(JSON.stringify({ type: 'join', userId: 'user-' + Date.now(), characterId }));
-    }
-  };
-
+  // ── UI ──
   return (
-    <div className="w-full h-screen bg-gray-900">
-      {!joined ? (
-        <div className="flex flex-col justify-center items-center h-full gap-4">
-            <h1 className="text-white text-2xl font-bold">Ragnarok 2.5D</h1>
-            <input 
-                className="p-2 rounded text-black"
-                placeholder="Enter Character ID" 
-                value={characterId}
-                onChange={(e) => setCharacterId(e.target.value)}
-            />
-            <button className="bg-blue-500 text-white p-2 rounded" onClick={handleJoin}>Join Game</button>
-            <p className="text-white">Status: {status}</p>
+    <div className="w-full h-screen bg-slate-950 flex flex-col justify-between overflow-hidden relative font-sans text-slate-100">
+      {isMockAuth && !joined && (
+        <div className="absolute top-0 left-0 right-0 bg-amber-500/10 border-b border-amber-500/20 py-2 px-4 text-center text-xs text-amber-300 z-50 backdrop-blur-sm">
+          ⚠️ Modo de prueba (Mock Auth) activo: no se han detectado variables de Supabase en .env.
+        </div>
+      )}
+
+      {!user ? (
+        <div className="flex flex-col justify-center items-center h-full gap-6 px-4 z-10">
+          <div className="bg-slate-900/60 backdrop-blur-md border border-slate-800 p-8 rounded-2xl shadow-2xl max-w-md w-full transition-all duration-300 hover:shadow-cyan-950/20">
+            <h1 className="text-4xl font-extrabold text-center text-transparent bg-clip-text bg-gradient-to-r from-sky-400 via-teal-200 to-indigo-400 mb-2">
+              Ragnarok 2.5D
+            </h1>
+            <p className="text-slate-400 text-center text-sm mb-6">Manejo de cuentas con Supabase Auth</p>
+            <div className="flex border-b border-slate-800 mb-6">
+              <button
+                className={`w-1/2 pb-3 font-semibold text-sm transition-all border-b-2 ${isLoginView ? 'border-sky-500 text-sky-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
+                onClick={() => { setIsLoginView(true); setErrorMessage(''); }}
+              >Ingresar</button>
+              <button
+                className={`w-1/2 pb-3 font-semibold text-sm transition-all border-b-2 ${!isLoginView ? 'border-sky-500 text-sky-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
+                onClick={() => { setIsLoginView(false); setErrorMessage(''); }}
+              >Crear Cuenta</button>
+            </div>
+            <form onSubmit={handleAuthSubmit} className="space-y-4">
+              {errorMessage && (
+                <div className="bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs p-3 rounded-lg text-center font-medium">{errorMessage}</div>
+              )}
+              <div>
+                <label className="block text-xs font-semibold text-sky-400 uppercase tracking-wider mb-2">Correo Electrónico</label>
+                <input type="email" className="w-full bg-slate-950 border border-slate-800 focus:border-sky-500 focus:ring-1 focus:ring-sky-500 p-3 rounded-xl text-slate-100 placeholder-slate-600 focus:outline-none transition-all"
+                  placeholder="name@domain.com" value={email} onChange={(e) => setEmail(e.target.value)} required />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-sky-400 uppercase tracking-wider mb-2">Contraseña</label>
+                <input type="password" className="w-full bg-slate-950 border border-slate-800 focus:border-sky-500 focus:ring-1 focus:ring-sky-500 p-3 rounded-xl text-slate-100 placeholder-slate-600 focus:outline-none transition-all"
+                  placeholder="••••••••" value={password} onChange={(e) => setPassword(e.target.value)} required />
+              </div>
+              <button type="submit" className="w-full py-3 bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-400 hover:to-indigo-500 active:from-sky-600 active:to-indigo-700 text-white font-bold rounded-xl shadow-lg transition-all transform hover:-translate-y-0.5 active:translate-y-0">
+                {isLoginView ? 'Ingresar' : 'Registrar Cuenta'}
+              </button>
+            </form>
+          </div>
+        </div>
+      ) : !joined ? (
+        <div className="flex flex-col justify-center items-center h-full px-4 z-10">
+          <div className="bg-slate-900/60 backdrop-blur-md border border-slate-800 p-8 rounded-2xl shadow-2xl max-w-2xl w-full transition-all">
+            <div className="flex justify-between items-center mb-6 pb-4 border-b border-slate-800">
+              <div>
+                <h2 className="text-xl font-bold text-sky-400">Selección de Personaje</h2>
+                <p className="text-xs text-slate-400">Usuario: <span className="font-mono text-slate-300">{user.email}</span></p>
+              </div>
+              <button onClick={handleSignOut} className="px-4 py-2 bg-slate-950 hover:bg-slate-800 text-slate-300 border border-slate-800 text-xs font-bold rounded-xl transition-all">Cerrar Sesión</button>
+            </div>
+            {errorMessage && (
+              <div className="bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs p-3 rounded-lg mb-6 text-center font-medium">{errorMessage}</div>
+            )}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-4">
+                <h3 className="text-xs font-semibold uppercase text-slate-400 tracking-wider">Tus Personajes</h3>
+                <div className="space-y-2.5 max-h-60 overflow-y-auto pr-1">
+                  {characters.length === 0 ? (
+                    <div className="text-center py-6 text-sm text-slate-500 border border-dashed border-slate-800 rounded-xl">No tienes personajes creados.</div>
+                  ) : characters.map((char) => (
+                    <div key={char.id} className="bg-slate-950/80 border border-slate-800/80 p-4 rounded-xl flex justify-between items-center hover:border-sky-500/50 transition-all">
+                      <div>
+                        <div className="font-bold text-slate-100">{char.name}</div>
+                        <div className="text-[10px] text-slate-500 font-mono mt-0.5">ID: {char.id.substring(0, 8)}...</div>
+                      </div>
+                      <button onClick={() => handleSelectCharacter(char.id)}
+                        className="px-3.5 py-1.5 bg-sky-500 hover:bg-sky-400 active:bg-sky-600 text-white font-bold text-xs rounded-lg shadow transition-all">Seleccionar</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="bg-slate-950/40 border border-slate-800/50 p-5 rounded-xl flex flex-col justify-between h-full">
+                <div className="space-y-4">
+                  <h3 className="text-xs font-semibold uppercase text-sky-400 tracking-wider">Crear Personaje</h3>
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-400 uppercase tracking-wider mb-2">Nombre del Personaje</label>
+                    <input type="text" className="w-full bg-slate-950 border border-slate-800 focus:border-sky-500 focus:ring-1 focus:ring-sky-500 p-2.5 rounded-lg text-slate-100 placeholder-slate-600 focus:outline-none text-sm transition-all"
+                      placeholder="e.g. NoviceRagnarok" value={newCharacterName} onChange={(e) => setNewCharacterName(e.target.value)} />
+                  </div>
+                </div>
+                <button onClick={handleCreateCharacter} disabled={!newCharacterName.trim()}
+                  className="w-full mt-6 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 active:from-emerald-600 active:to-teal-700 text-white font-bold text-xs rounded-xl shadow disabled:opacity-50 disabled:pointer-events-none transition-all">Crear Nuevo</button>
+              </div>
+            </div>
+          </div>
         </div>
       ) : (
-        <div ref={mountRef} className="w-full h-full" />
+        <div className="w-full h-full relative">
+          <div ref={mountRef} className="w-full h-full" />
+          <div className="absolute top-4 left-4 bg-slate-950/70 backdrop-blur-sm border border-slate-800 px-4 py-3 rounded-xl pointer-events-none select-none">
+            <h2 className="text-sky-400 font-bold text-sm">Ragnarok 2.5D</h2>
+            <p className="text-slate-400 text-xs mt-1">
+              Personaje: <span className="text-slate-200 font-mono">
+                {characters.find(c => c.id === characterId)?.name || characterId}
+              </span>
+            </p>
+            <p className="text-slate-400 text-xs">
+              Mapa: <span className="text-emerald-400">{mapDataRef.current?.config?.type || 'field'}</span>
+              {' · '}
+              Seed: <span className="text-slate-300 font-mono">{mapDataRef.current?.config?.seed || '—'}</span>
+            </p>
+            <p className="text-slate-400 text-xs">
+              Status: <span className="text-emerald-400">Online</span>
+            </p>
+          </div>
+          <div className="absolute top-4 right-4 flex gap-2 z-20">
+            <button onClick={handleLeaveGame}
+              className="px-4 py-2 bg-slate-950/80 hover:bg-slate-800 border border-slate-800 text-xs font-bold rounded-xl transition-all">Volver a Selección</button>
+          </div>
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-slate-950/70 backdrop-blur-sm border border-slate-800 px-6 py-2 rounded-full pointer-events-none select-none text-xs text-slate-300">
+            🖱️ <strong>Left Click</strong> on the ground to move. Walk onto the <span className="text-red-400 font-bold">red portal</span> to change maps.
+          </div>
+        </div>
       )}
     </div>
   );
