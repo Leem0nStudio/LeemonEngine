@@ -1,7 +1,7 @@
 -- SQL script for Supabase
 create table characters (
   id uuid primary key default uuid_generate_v4(),
-  user_id uuid references auth.users,
+  user_id uuid, -- Reference to auth.users (can be linked later once auth is implemented)
   name text not null,
   pos_x float not null default 0,
   pos_z float not null default 0,
