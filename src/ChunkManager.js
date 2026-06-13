@@ -264,11 +264,9 @@ export class ChunkManager {
     geometry.setIndex(new THREE.BufferAttribute(workerData.indices, 1));
     geometry.computeVertexNormals();
 
-    const material = this._getSharedMaterial('terrain_mat', () => new THREE.MeshStandardMaterial({
+    const material = this._getSharedMaterial('terrain_mat', () => new THREE.MeshLambertMaterial({
       vertexColors: true,
       side: THREE.FrontSide,
-      roughness: 0.8,
-      metalness: 0.1,
     }));
 
     const mesh = new THREE.Mesh(geometry, material);
@@ -355,11 +353,9 @@ export class ChunkManager {
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
 
-    const material = this._getSharedMaterial('terrain_mat', () => new THREE.MeshStandardMaterial({
+    const material = this._getSharedMaterial('terrain_mat', () => new THREE.MeshLambertMaterial({
       vertexColors: true,
       side: THREE.FrontSide,
-      roughness: 0.8,
-      metalness: 0.1,
     }));
 
     const mesh = new THREE.Mesh(geometry, material);
@@ -395,7 +391,7 @@ export class ChunkManager {
         const trunkGeo = this._getSharedGeometry(`tree_trunk_${first.subType}`, () =>
           new THREE.CylinderGeometry(cfg.trunkR * 0.7, cfg.trunkR, cfg.trunkH, 6));
         const trunkMat = this._getSharedMaterial(`tree_trunk_mat_${cfg.trunkColor}`, () =>
-          new THREE.MeshStandardMaterial({ color: cfg.trunkColor, roughness: 0.9 }));
+          new THREE.MeshLambertMaterial({ color: cfg.trunkColor }));
         const trunkMesh = new THREE.InstancedMesh(trunkGeo, trunkMat, decs.length);
         trunkMesh.castShadow = true;
 
@@ -415,7 +411,7 @@ export class ChunkManager {
           const canopyGeo = this._getSharedGeometry(`tree_canopy_${first.subType}`, () =>
             new THREE.SphereGeometry(cfg.canopyR, 6, 5));
           const canopyMat = this._getSharedMaterial(`tree_canopy_mat_${cfg.canopyColor}`, () =>
-            new THREE.MeshStandardMaterial({ color: cfg.canopyColor, roughness: 0.8 }));
+            new THREE.MeshLambertMaterial({ color: cfg.canopyColor }));
           const canopyMesh = new THREE.InstancedMesh(canopyGeo, canopyMat, decs.length);
           canopyMesh.castShadow = true;
 
@@ -432,7 +428,7 @@ export class ChunkManager {
         }
       } else if (first.type === "rock") {
         const mat = this._getSharedMaterial(`rock_mat_${ROCK_COLORS[0]}`, () =>
-          new THREE.MeshStandardMaterial({ color: ROCK_COLORS[0], roughness: 0.7, metalness: 0.2 }));
+          new THREE.MeshLambertMaterial({ color: ROCK_COLORS[0] }));
         const mesh = new THREE.InstancedMesh(this._rockGeo, mat, decs.length);
         mesh.castShadow = true;
 
@@ -450,7 +446,7 @@ export class ChunkManager {
         result.push(mesh);
       } else if (first.type === "bush") {
         const mat = this._getSharedMaterial('bush_mat', () =>
-          new THREE.MeshStandardMaterial({ color: 0x388e3c, roughness: 0.8 }));
+          new THREE.MeshLambertMaterial({ color: 0x388e3c }));
         const mesh = new THREE.InstancedMesh(this._bushGeo, mat, decs.length);
         mesh.castShadow = true;
 
