@@ -12,6 +12,8 @@ import { TerrainBuilder } from './TerrainBuilder';
 import { ChunkManager } from './ChunkManager';
 import { MapEditor } from './MapEditor';
 import { DebugUI } from './DebugUI';
+import { MAPS, getMap, DEFAULT_MAP } from '../shared/MapRegistry.js';
+import { PortalFX } from './PortalFX.js';
 
 // Initialize Supabase Client
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
@@ -60,6 +62,11 @@ export default function App() {
   const playersDataRef = useRef<Map<string, { x: number, z: number, name?: string }>>(new Map());
   const charSpriteMaterial = useRef<THREE.SpriteMaterial | null>(null);
   const localPlayerId = useRef<string | null>(null);
+
+  // Map state
+  const currentMapId = useRef<string>(DEFAULT_MAP);
+  const portalObjects = useRef<PortalFX[]>([]);
+  const fadeOverlay = useRef<HTMLDivElement | null>(null);
 
   // ── Supabase / Mock Auth Session Loader ──
   useEffect(() => {
@@ -255,15 +262,22 @@ export default function App() {
     localPlayerId.current = charId;
     setPlayerName(charName);
     playersDataRef.current.clear();
-    playersDataRef.current.set(charId, { x: posX, z: posZ, name: charName });
+
+    currentMapId.current = DEFAULT_MAP;
+    const mapDef = getMap(DEFAULT_MAP);
+    const spawn = mapDef?.spawnPoint || { x: 100, z: 100 };
+    const finalX = (posX === 100 && posZ === 100) ? spawn.x : posX;
+    const finalZ = (posZ === 100 && posX === 100) ? spawn.z : posZ;
+
+    playersDataRef.current.set(charId, { x: finalX, z: finalZ, name: charName });
 
     mapDataRef.current = {
-      config: { seed: 42, size: 200 },
-      spawnPoint: { x: posX, z: posZ },
+      config: { seed: mapDef?.seed || 42, size: mapDef?.size || 200 },
+      spawnPoint: { x: finalX, z: finalZ },
     };
 
     if (!isMockAuth) {
-      setupRealtime(charId, charName, posX, posZ);
+      setupRealtime(charId, charName, finalX, finalZ);
     } else {
       setStatus('Offline (mock)');
     }
@@ -371,25 +385,87 @@ export default function App() {
     }
   };
 
+  // ── Map Loading ──
+  const loadMap = useCallback((mapId: string, targetX: number, targetZ: number) => {
+    const mapDef = getMap(mapId);
+    if (!mapDef) return;
+    currentMapId.current = mapId;
+
+    // Dispose portal objects
+    for (const p of portalObjects.current) {
+      p.dispose(sceneRef.current!);
+    }
+    portalObjects.current = [];
+
+    // Dispose chunk manager
+    if (chunkManagerRef.current) {
+      chunkManagerRef.current.dispose();
+      chunkManagerRef.current = null;
+    }
+
+    // Clear all player sprites (keep local player data)
+    const localId = localPlayerId.current;
+    const localData = localId ? playersDataRef.current.get(localId) : null;
+    playersRef.current.forEach((group) => {
+      sceneRef.current?.remove(group);
+    });
+    playersRef.current.clear();
+    playersDataRef.current.clear();
+    if (localData && localId) {
+      playersDataRef.current.set(localId, { ...localData, x: targetX, z: targetZ });
+    }
+
+    // Broadcast position change to others
+    if (localId && realtimeChannel.current) {
+      realtimeChannel.current.send({
+        type: 'broadcast',
+        event: 'move',
+        payload: { playerId: localId, x: targetX, z: targetZ, name: playerName },
+      });
+    }
+
+    mapDataRef.current = {
+      config: { seed: mapDef.seed, size: mapDef.size },
+      spawnPoint: { x: targetX, z: targetZ },
+    };
+
+    setJoined(false);
+    requestAnimationFrame(() => setJoined(true));
+  }, [playerName]);
+
+  // ── Fade Transition ──
+  const fadeOut = (cb: () => void) => {
+    if (fadeOverlay.current) {
+      fadeOverlay.current.style.opacity = '1';
+      setTimeout(cb, 350);
+    } else {
+      cb();
+    }
+  };
+
+  const fadeIn = () => {
+    setTimeout(() => {
+      if (fadeOverlay.current) fadeOverlay.current.style.opacity = '0';
+    }, 100);
+  };
+
   // ── Three.js Canvas Effect ──
   useEffect(() => {
     if (!joined || !mountRef.current || !mapDataRef.current) return;
     const mapData = mapDataRef.current;
     const { config } = mapData;
 
-    // 1. Scene
+    // 1. Scene — Ragnarok style: black background, close fog
     const scene = new THREE.Scene();
     sceneRef.current = scene;
-    scene.background = new THREE.Color(0x87ceeb);
+    scene.background = new THREE.Color(0x000000);
+    scene.fog = new THREE.Fog(0x000000, 25, 70);
 
-    // Fog for atmosphere on large world
-    scene.fog = new THREE.Fog(0x87ceeb, 60, 150);
-
-    // 2. Lighting
-    const hemiLight = new THREE.HemisphereLight(0x87ceeb, 0x4caf50, 0.7);
+    // 2. Lighting — Ragnarok inspired: warm sun, dim ambient, deep shadows
+    const hemiLight = new THREE.HemisphereLight(0x87ceeb, 0x2d5a27, 0.5);
     scene.add(hemiLight);
 
-    const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+    const sun = new THREE.DirectionalLight(0xffeedd, 1.0);
     sun.position.set(80, 120, 80);
     sun.castShadow = true;
     sun.shadow.mapSize.width = 2048;
@@ -403,7 +479,7 @@ export default function App() {
     sun.shadow.camera.far = 300;
     scene.add(sun);
 
-    const ambient = new THREE.AmbientLight(0xffffff, 0.35);
+    const ambient = new THREE.AmbientLight(0x404060, 0.25);
     scene.add(ambient);
 
     // 3. Camera – orthographic for 2.5D Ragnarok style
@@ -417,10 +493,12 @@ export default function App() {
       0.1, 500,
     );
     cameraRef.current = camera;
-    // Initial camera position: look at center of terrain from isometric angle
-    const centerH = mapData.heightmap?.[100]?.[100] ?? 0;
-    camera.position.set(100 + 40, centerH + 40, 100 + 40);
-    camera.lookAt(100, centerH, 100);
+    // Initial camera position: look at spawn from isometric angle
+    const spawnX = mapData.spawnPoint?.x || 100;
+    const spawnZ = mapData.spawnPoint?.z || 100;
+    const spawnH = chunkManager.getHeight(spawnX, spawnZ) || 0;
+    camera.position.set(spawnX + 40, spawnH + 40, spawnZ + 40);
+    camera.lookAt(spawnX, spawnH, spawnZ);
     scene.add(camera);
 
     // 4. Renderer
@@ -432,11 +510,19 @@ export default function App() {
 
     // 5. Build procedural terrain (new chunk-based streaming system)
     const seed = mapData.config?.seed || 42;
-    console.log('[Terrain] Initializing chunk system:', { seed });
-    const chunkManager = new ChunkManager(scene, seed);
+    const mapDef = getMap(currentMapId.current);
+    const mapConfig = mapDef ? {
+      prefabs: mapDef.prefabs,
+      blockedDecorations: mapDef.blockedDecorations,
+      terrainTexture: mapDef.terrainTexture,
+    } : null;
+    console.log('[Terrain] Initializing chunk system:', { seed, mapId: currentMapId.current });
+    const chunkManager = new ChunkManager(scene, seed, mapConfig);
     // Load initial chunks around spawn
     chunkManager.update(mapData.spawnPoint?.x || 100, mapData.spawnPoint?.z || 100);
     chunkManagerRef.current = chunkManager;
+    // Build prefabs (statics placed at fixed world coords)
+    chunkManager.buildPrefabs();
     console.log('[Terrain] Chunk system ready. Scene children:', scene.children.length);
 
     // 5b. Map Editor (E key toggle)
@@ -446,6 +532,17 @@ export default function App() {
     // 5c. Debug UI (Ctrl+D toggle)
     const debugUI = new DebugUI({ scene, seed, chunkManager });
     debugUIRef.current = debugUI;
+
+    // 5d. Build portals for this map
+    const mapDef2 = getMap(currentMapId.current);
+    if (mapDef2 && mapDef2.portals) {
+      for (const portal of mapDef2.portals) {
+        const h = chunkManager.getHeight(portal.x, portal.z) || 0;
+        const pf = new PortalFX();
+        pf.build(scene, portal.x, h, portal.z);
+        portalObjects.current.push(pf);
+      }
+    }
 
     // 6. Character material
     const textureLoader = new THREE.TextureLoader();
@@ -507,6 +604,22 @@ export default function App() {
               event: 'move',
               payload: { playerId: localPlayerId.current!, x: gridX, z: gridZ, name: playerName },
             });
+
+            // Portal detection
+            const curMap = getMap(currentMapId.current);
+            if (curMap && curMap.portals) {
+              for (const portal of curMap.portals) {
+                const dx = gridX - portal.x;
+                const dz = gridZ - portal.z;
+                if (Math.sqrt(dx * dx + dz * dz) < 1.5) {
+                  fadeOut(() => {
+                    loadMap(portal.targetMap, portal.targetX, portal.targetZ);
+                    fadeIn();
+                  });
+                  break;
+                }
+              }
+            }
           }
           break;
         }
@@ -544,6 +657,7 @@ export default function App() {
 
     // 10. Animation loop
     let animationId: number;
+    let portalTime = 0;
     function animate() {
       animationId = requestAnimationFrame(animate);
 
@@ -551,6 +665,12 @@ export default function App() {
       const localPlayer = playersDataRef.current.get(localPlayerId.current || '');
       if (localPlayer && chunkManagerRef.current) {
         chunkManagerRef.current.update(localPlayer.x, localPlayer.z);
+      }
+
+      // Animate portal glow and rotation
+      portalTime += 0.016;
+      for (const p of portalObjects.current) {
+        p.update(portalTime);
       }
 
       debugUI.update();
@@ -563,6 +683,13 @@ export default function App() {
       window.removeEventListener('resize', handleResize);
       mountRef.current?.removeEventListener('click', handleClick);
       document.removeEventListener('keydown', handleKeyDown);
+
+      // Dispose portals
+      for (const p of portalObjects.current) {
+        p.dispose(scene);
+      }
+      portalObjects.current = [];
+
       debugUI.dispose();
       debugUIRef.current = null;
       if (chunkManagerRef.current) {
@@ -686,7 +813,7 @@ export default function App() {
               </span>
             </p>
             <p className="text-slate-400 text-xs">
-              Mapa: <span className="text-emerald-400">{mapDataRef.current?.config?.size || 200}×{mapDataRef.current?.config?.size || 200}</span>
+              Mapa: <span className="text-emerald-400">{getMap(currentMapId.current)?.name || currentMapId.current}</span>
               {' · '}
               Seed: <span className="text-slate-300 font-mono">{mapDataRef.current?.config?.seed || '—'}</span>
             </p>
@@ -703,6 +830,19 @@ export default function App() {
           </div>
         </div>
       )}
+      {/* Fade overlay for map transitions */}
+      <div
+        ref={fadeOverlay}
+        style={{
+          position: 'fixed',
+          inset: 0,
+          background: 'black',
+          zIndex: 999,
+          opacity: 0,
+          transition: 'opacity 0.3s',
+          pointerEvents: 'none',
+        }}
+      />
     </div>
   );
 }

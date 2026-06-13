@@ -204,7 +204,7 @@ function isRiver(wx, wz, riverSet) {
  * @param {object} [overrides] - Map modifications to apply
  * @returns {object} Chunk data
  */
-export function generateChunk(seed, cx, cz, overrides = null) {
+export function generateChunk(seed, cx, cz, overrides = null, blockedDecorations = null) {
   // Create deterministic RNG for this chunk
   const chunkSeed = seed + cx * 73856093 ^ cz * 19349669;
   const rng = mulberry32(chunkSeed);
@@ -343,6 +343,32 @@ export function generateChunk(seed, cx, cz, overrides = null) {
     }
   }
 
+  // Filter decorations blocked by map-defined areas
+  if (blockedDecorations && blockedDecorations.length > 0) {
+    for (const block of blockedDecorations) {
+      const bx = block.x;
+      const bz = block.z;
+      const br = block.radius || 3;
+      const br2 = br * br;
+      for (let i = decorations.length - 1; i >= 0; i--) {
+        const d = decorations[i];
+        const dx = d.x - bx;
+        const dz = d.z - bz;
+        if (dx * dx + dz * dz < br2) {
+          decorations.splice(i, 1);
+        }
+      }
+      for (let i = collisionCircles.length - 1; i >= 0; i--) {
+        const c = collisionCircles[i];
+        const dx = c.x - bx;
+        const dz = c.z - bz;
+        if (dx * dx + dz * dz < br2) {
+          collisionCircles.splice(i, 1);
+        }
+      }
+    }
+  }
+
   // Apply overrides
   if (overrides && overrides.length > 0) {
     for (const ov of overrides) {
@@ -402,4 +428,45 @@ export function sampleHeight(seed, wx, wz) {
   const lx = ((wx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
   const lz = ((wz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
   return chunk.heightmap[Math.floor(lz)]?.[Math.floor(lx)] ?? 0;
+}
+
+/**
+ * Generate UV coordinates for texture atlas based on height and biome.
+ * Each tile is a 64x64 region in the atlas (256x256 atlas = 4x4 grid).
+ * heightMapping: [{ min, max, tileIndex }]
+ */
+export function generateUVs(heightmap, biomeMap, heightMapping) {
+  if (!heightMapping || heightMapping.length === 0) return null;
+
+  const gridCount = heightmap.length;
+  const uv = new Float32Array(gridCount * gridCount * 2);
+  const tileSize = 1 / 4;
+
+  for (let lz = 0; lz < gridCount; lz++) {
+    for (let lx = 0; lx < gridCount; lx++) {
+      const i = lz * gridCount + lx;
+      const h = heightmap[lz][lx];
+      let tile = 0;
+
+      for (const mapping of heightMapping) {
+        if (h >= mapping.min && h < mapping.max) {
+          tile = mapping.tileIndex;
+          break;
+        }
+      }
+
+      const tx = tile % 4;
+      const ty = Math.floor(tile / 4);
+      const u0 = tx * tileSize;
+      const v0 = 1 - (ty + 1) * tileSize;
+      const u1 = (tx + 1) * tileSize;
+      const v1 = 1 - ty * tileSize;
+
+      const margin = 0.003;
+      uv[i * 2] = u0 + margin + (lx % 2) * (u1 - u0 - margin * 2);
+      uv[i * 2 + 1] = v0 + margin + (lz % 2) * (v1 - v0 - margin * 2);
+    }
+  }
+
+  return uv;
 }

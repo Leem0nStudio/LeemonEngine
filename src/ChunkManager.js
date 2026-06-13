@@ -13,8 +13,10 @@ import {
   LOD_LEVELS,
   BIOMES,
   generateChunk,
+  generateUVs,
   mulberry32,
 } from "../shared/TerrainChunk.js";
+import { PREFABS } from "../shared/PrefabLibrary.js";
 
 // ─── Web Worker Setup ─────────────────────────────────────────────────────
 let chunkWorker = null;
@@ -113,11 +115,13 @@ export class ChunkManager {
    * @param {THREE.Scene} scene
    * @param {number} seed - Global world seed
    */
-  constructor(scene, seed) {
+  constructor(scene, seed, mapConfig = null) {
     this.scene = scene;
     this.seed = seed;
-    this.chunks = new Map(); // key: "cx,cz" -> { data, mesh, decorations, ... }
+    this.mapConfig = mapConfig;
+    this.chunks = new Map();
     this.lastPlayerChunk = { cx: -999, cz: -999 };
+    this._prefabGroups = [];
 
     // Resource cache to prevent redundant GPU uploads and GC pressure
     this._materials = new Map();
@@ -127,6 +131,36 @@ export class ChunkManager {
     this._rockGeo = this._getSharedGeometry('rock_base', () => new THREE.DodecahedronGeometry(0.5, 0));
     this._bushGeo = this._getSharedGeometry('bush_base', () => new THREE.SphereGeometry(0.4, 5, 4));
     this._flowerGeo = this._getSharedGeometry('flower_base', () => new THREE.ConeGeometry(0.1, 0.3, 4));
+  }
+
+  /**
+   * Build prefabs from map config.
+   */
+  buildPrefabs() {
+    const cfg = this.mapConfig;
+    if (!cfg || !cfg.prefabs || cfg.prefabs.length === 0) return;
+    for (const pf of cfg.prefabs) {
+      const h = this.getHeight(pf.x, pf.z);
+      const group = this._buildSinglePrefab(pf, h);
+      if (group) {
+        this.scene.add(group);
+        this._prefabGroups.push(group);
+      }
+    }
+  }
+
+  _buildSinglePrefab(pf, h) {
+    const def = PREFABS[pf.model];
+    if (!def) return null;
+    if (def.build) {
+      try {
+        return def.build(this.scene, { x: pf.x, z: pf.z, h, scale: pf.scale || 1 });
+      } catch (e) {
+        console.warn(`[ChunkManager] Failed to build prefab ${pf.model}:`, e);
+        return null;
+      }
+    }
+    return null;
   }
 
   /**
@@ -203,17 +237,15 @@ export class ChunkManager {
 
     const loadFn = async () => {
       try {
-        // Generate chunk data (worker or main thread)
+        const blocked = this.mapConfig?.blockedDecorations || null;
         const workerResult = await generateChunkAsync(this.seed, cx, cz);
 
-        // If worker returned pre-built geometry, use it directly
         if (workerResult.positions) {
-          const data = generateChunk(this.seed, cx, cz); // Still need decorations
+          const data = generateChunk(this.seed, cx, cz, null, blocked);
           const chunkEntry = this._buildChunkMeshesFromWorker(data, workerResult);
           this.chunks.set(key, chunkEntry);
         } else {
-          // Fallback: generate full data on main thread
-          const data = generateChunk(this.seed, cx, cz);
+          const data = generateChunk(this.seed, cx, cz, null, blocked);
           buildFromData(data);
         }
       } catch (err) {
@@ -256,16 +288,27 @@ export class ChunkManager {
    */
   _buildChunkMeshesFromWorker(data, workerData) {
     const meshes = [];
+    const atlasMat = this._getOrCreateTerrainAtlas();
 
-    // 1. Terrain mesh from worker positions/colors/indices
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute("position", new THREE.BufferAttribute(workerData.positions, 3));
     geometry.setAttribute("color", new THREE.BufferAttribute(workerData.colors, 3));
     geometry.setIndex(new THREE.BufferAttribute(workerData.indices, 1));
     geometry.computeVertexNormals();
 
-    const material = this._getSharedMaterial('terrain_mat', () => new THREE.MeshLambertMaterial({
-      vertexColors: true,
+    if (atlasMat) {
+      const heightMapping = this.mapConfig?.terrainTexture?.heightMapping || null;
+      if (heightMapping) {
+        const uvs = generateUVs(data.heightmap, data.biomeMap, heightMapping);
+        if (uvs) {
+          geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+          geometry.deleteAttribute("color");
+        }
+      }
+    }
+
+    const material = atlasMat || this._getSharedMaterial('terrain_mat', () => new THREE.MeshLambertMaterial({
+      vertexColors: !atlasMat,
       side: THREE.FrontSide,
     }));
 
@@ -286,18 +329,61 @@ export class ChunkManager {
     return { data, meshes };
   }
 
-  /**
-   * Build terrain mesh for a chunk with vertex colors.
-   */
+  _getOrCreateTerrainAtlas() {
+    const cfg = this.mapConfig;
+    if (!cfg || !cfg.terrainTexture) return null;
+    const key = `atlas_${this.seed}`;
+    if (this._materials.has(key)) return this._materials.get(key);
+
+    const tiles = cfg.terrainTexture.tiles || ['#5daa35','#8c6e42','#9e9e9e','#42a5f5','#e8edf2'];
+    const tileSize = 64;
+    const cols = 4;
+    const rows = Math.ceil(tiles.length / cols);
+    const canvas = document.createElement('canvas');
+    canvas.width = cols * tileSize;
+    canvas.height = rows * tileSize;
+    const ctx = canvas.getContext('2d');
+
+    tiles.forEach((color, i) => {
+      const tx = (i % cols) * tileSize;
+      const ty = Math.floor(i / cols) * tileSize;
+      ctx.fillStyle = color;
+      ctx.fillRect(tx, ty, tileSize, tileSize);
+      ctx.strokeStyle = 'rgba(0,0,0,0.08)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(tx, ty, tileSize, tileSize);
+    });
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+    texture.magFilter = THREE.NearestFilter;
+    texture.minFilter = THREE.NearestFilter;
+
+    const mat = new THREE.MeshLambertMaterial({
+      map: texture,
+      side: THREE.FrontSide,
+    });
+    this._materials.set(key, mat);
+    return mat;
+  }
+
   _buildTerrainMesh(data) {
     const { heightmap, biomeMap } = data;
     const gridCount = CHUNK_SIZE + 1;
+    const useTexture = this.mapConfig?.terrainTexture !== null && this.mapConfig?.terrainTexture !== undefined;
+    const atlasMat = useTexture ? this._getOrCreateTerrainAtlas() : null;
+    const heightMapping = useTexture ? this.mapConfig.terrainTexture.heightMapping : null;
 
     const geometry = new THREE.BufferGeometry();
     const vertexCount = gridCount * gridCount;
     const positions = new Float32Array(vertexCount * 3);
     const colors = new Float32Array(vertexCount * 3);
     const tmpColor = new THREE.Color();
+
+    let uvs = null;
+    if (useTexture && atlasMat && heightMapping) {
+      uvs = generateUVs(heightmap, biomeMap, heightMapping);
+    }
 
     for (let lz = 0; lz < gridCount; lz++) {
       for (let lx = 0; lx < gridCount; lx++) {
@@ -310,7 +396,6 @@ export class ChunkManager {
         positions[i * 3 + 1] = h;
         positions[i * 3 + 2] = data.worldOffsetZ + lz;
 
-        // Slope-based coloring
         let slope = 0;
         if (lz > 0 && lz < gridCount - 1 && lx > 0 && lx < gridCount - 1) {
           const sx = Math.abs(heightmap[lz][lx + 1] - heightmap[lz][lx - 1]) / 2;
@@ -324,7 +409,6 @@ export class ChunkManager {
           tmpColor.copy(palette.dirt);
         } else {
           tmpColor.copy(palette.grass);
-          // Subtle variation
           const v = Math.sin((data.worldOffsetX + lx) * 0.2) * Math.cos((data.worldOffsetZ + lz) * 0.2) * 0.08;
           tmpColor.r += v;
           tmpColor.g += v;
@@ -336,7 +420,6 @@ export class ChunkManager {
       }
     }
 
-    // Indices
     const indices = [];
     for (let lz = 0; lz < CHUNK_SIZE; lz++) {
       for (let lx = 0; lx < CHUNK_SIZE; lx++) {
@@ -349,12 +432,17 @@ export class ChunkManager {
     }
 
     geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
 
-    const material = this._getSharedMaterial('terrain_mat', () => new THREE.MeshLambertMaterial({
-      vertexColors: true,
+    if (uvs) {
+      geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+    } else {
+      geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    }
+
+    const material = atlasMat || this._getSharedMaterial('terrain_mat', () => new THREE.MeshLambertMaterial({
+      vertexColors: !uvs,
       side: THREE.FrontSide,
     }));
 
@@ -511,6 +599,12 @@ export class ChunkManager {
       this._unloadChunk(chunk);
     }
     this.chunks.clear();
+
+    // Remove prefabs
+    for (const g of this._prefabGroups) {
+      this.scene.remove(g);
+    }
+    this._prefabGroups = [];
 
     // Dispose cached materials
     for (const mat of this._materials.values()) {
