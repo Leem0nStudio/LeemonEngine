@@ -3,69 +3,15 @@
  *
  * Loads/unloads chunks based on player position.
  * Uses InstancedMesh for efficient decoration rendering.
- * Offloads geometry generation to Web Worker when available.
  */
 import * as THREE from "three";
 import {
   CHUNK_SIZE,
-  CHUNK_WORLD_SIZE,
   VIEW_RADIUS,
-  LOD_LEVELS,
-  BIOMES,
   generateChunk,
   generateUVs,
-  mulberry32,
 } from "../shared/TerrainChunk.js";
 import { PREFABS } from "../shared/PrefabLibrary.js";
-
-// ─── Web Worker Setup ─────────────────────────────────────────────────────
-let chunkWorker = null;
-let workerCallbacks = new Map();
-let workerIdCounter = 0;
-
-try {
-  chunkWorker = new Worker(
-    new URL("./workers/chunkWorker.js", import.meta.url),
-  );
-  chunkWorker.onmessage = (e) => {
-    const { id, type } = e.data;
-    const cb = workerCallbacks.get(id);
-    if (cb) {
-      workerCallbacks.delete(id);
-      if (type === "result") cb.resolve(e.data);
-      else cb.reject(new Error(e.data.error));
-    }
-  };
-  chunkWorker.onerror = (err) => {
-    console.warn("[ChunkManager] Worker error, falling back to main thread:", err);
-    chunkWorker = null;
-  };
-} catch (e) {
-    console.warn("[ChunkManager] Web Workers not available, using main thread:", e);
-}
-
-function generateChunkAsync(seed, cx, cz) {
-  return new Promise((resolve, reject) => {
-    if (chunkWorker) {
-      const id = workerIdCounter++;
-      workerCallbacks.set(id, { resolve, reject });
-      chunkWorker.postMessage({ type: "generate", seed, cx, cz, id });
-    } else {
-      // Fallback: generate on main thread
-      try {
-        const data = generateChunk(seed, cx, cz);
-        resolve({
-          cx, cz,
-          positions: null, // Will be built by _buildTerrainMesh
-          colors: null,
-          indices: null,
-        });
-      } catch (err) {
-        reject(err);
-      }
-    }
-  });
-}
 
 // ─── Color Palettes per Biome ───────────────────────────────────────────────
 let _colors = null;
@@ -226,7 +172,7 @@ export class ChunkManager {
   }
 
   /**
-   * Load a chunk asynchronously using Web Worker or requestIdleCallback.
+   * Load a chunk asynchronously using requestIdleCallback.
    */
   _loadChunkAsync(cx, cz) {
     const key = `${cx},${cz}`;
@@ -240,19 +186,11 @@ export class ChunkManager {
       this.chunks.set(key, chunkEntry);
     };
 
-    const loadFn = async () => {
+    const loadFn = () => {
       try {
         const blocked = this.mapConfig?.blockedDecorations || null;
-        const workerResult = await generateChunkAsync(this.seed, cx, cz);
-
-        if (workerResult.positions) {
-          const data = generateChunk(this.seed, cx, cz, null, blocked);
-          const chunkEntry = this._buildChunkMeshesFromWorker(data, workerResult);
-          this.chunks.set(key, chunkEntry);
-        } else {
-          const data = generateChunk(this.seed, cx, cz, null, blocked);
-          buildFromData(data);
-        }
+        const data = generateChunk(this.seed, cx, cz, null, blocked);
+        buildFromData(data);
       } catch (err) {
         console.error(`[ChunkManager] Failed to load chunk (${cx},${cz}):`, err);
         this.chunks.delete(key);
@@ -277,52 +215,6 @@ export class ChunkManager {
     // 1. Terrain mesh (with vertex colors)
     const terrainMesh = this._buildTerrainMesh(data);
     meshes.push(terrainMesh);
-
-    // 2. Decoration instances
-    const decMeshes = this._buildDecorationMeshes(data);
-    meshes.push(...decMeshes);
-
-    // Add all to scene
-    for (const m of meshes) this.scene.add(m);
-
-    return { data, meshes };
-  }
-
-  /**
-   * Build meshes using pre-computed worker geometry data.
-   */
-  _buildChunkMeshesFromWorker(data, workerData) {
-    const meshes = [];
-    const atlasMat = this._getOrCreateTerrainAtlas();
-
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(workerData.positions, 3));
-    geometry.setAttribute("color", new THREE.BufferAttribute(workerData.colors, 3));
-    geometry.setIndex(new THREE.BufferAttribute(workerData.indices, 1));
-    geometry.computeVertexNormals();
-
-    if (atlasMat) {
-      const heightMapping = this.mapConfig?.terrainTexture?.heightMapping || null;
-      if (heightMapping) {
-        const uvs = generateUVs(data.heightmap, data.biomeMap, heightMapping);
-        if (uvs) {
-          geometry.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
-          geometry.deleteAttribute("color");
-        }
-      }
-    }
-
-    const material = atlasMat || this._getSharedMaterial('terrain_mat', () => new THREE.MeshLambertMaterial({
-      vertexColors: !atlasMat,
-      side: THREE.FrontSide,
-    }));
-
-    const mesh = new THREE.Mesh(geometry, material);
-    mesh.receiveShadow = true;
-    mesh.userData.isTerrain = true;
-    mesh.userData.chunkCx = data.cx;
-    mesh.userData.chunkCz = data.cz;
-    meshes.push(mesh);
 
     // 2. Decoration instances
     const decMeshes = this._buildDecorationMeshes(data);
