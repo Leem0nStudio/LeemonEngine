@@ -69,33 +69,39 @@ function generateChunkAsync(seed, cx, cz) {
 }
 
 // ─── Color Palettes per Biome ───────────────────────────────────────────────
-const BIOME_COLORS = {
-  prairie: {
-    grass: new THREE.Color(0x5daa35),
-    dirt: new THREE.Color(0x8c6e42),
-    stone: new THREE.Color(0x9e9e9e),
-  },
-  forest: {
-    grass: new THREE.Color(0x2e7d32),
-    dirt: new THREE.Color(0x6d4c2a),
-    stone: new THREE.Color(0x808080),
-  },
-  desert: {
-    grass: new THREE.Color(0xd4c573),
-    dirt: new THREE.Color(0xc4a84a),
-    stone: new THREE.Color(0xb0a080),
-  },
-  snow: {
-    grass: new THREE.Color(0xe8edf2),
-    dirt: new THREE.Color(0xb0b5ba),
-    stone: new THREE.Color(0x90959a),
-  },
-  swamp: {
-    grass: new THREE.Color(0x4a7035),
-    dirt: new THREE.Color(0x665c33),
-    stone: new THREE.Color(0x707560),
-  },
-};
+let _colors = null;
+function getBiomeColors() {
+  if (!_colors) {
+    _colors = {
+      prairie: {
+        grass: new THREE.Color(0x5daa35),
+        dirt: new THREE.Color(0x8c6e42),
+        stone: new THREE.Color(0x9e9e9e),
+      },
+      forest: {
+        grass: new THREE.Color(0x2e7d32),
+        dirt: new THREE.Color(0x6d4c2a),
+        stone: new THREE.Color(0x808080),
+      },
+      desert: {
+        grass: new THREE.Color(0xd4c573),
+        dirt: new THREE.Color(0xc4a84a),
+        stone: new THREE.Color(0xb0a080),
+      },
+      snow: {
+        grass: new THREE.Color(0xe8edf2),
+        dirt: new THREE.Color(0xb0b5ba),
+        stone: new THREE.Color(0x90959a),
+      },
+      swamp: {
+        grass: new THREE.Color(0x4a7035),
+        dirt: new THREE.Color(0x665c33),
+        stone: new THREE.Color(0x707560),
+      },
+    };
+  }
+  return _colors;
+}
 
 // ─── Decoration Templates ───────────────────────────────────────────────────
 const TREE_CONFIGS = {
@@ -390,7 +396,8 @@ export class ChunkManager {
         const i = lz * gridCount + lx;
         const h = heightmap[lz][lx];
         const biome = biomeMap[lz][lx];
-        const palette = BIOME_COLORS[biome] || BIOME_COLORS.prairie;
+        const colors = getBiomeColors();
+        const palette = colors[biome] || colors.prairie;
 
         positions[i * 3] = data.worldOffsetX + lx;
         positions[i * 3 + 1] = h;

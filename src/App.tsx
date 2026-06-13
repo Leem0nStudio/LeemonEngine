@@ -12,7 +12,7 @@ import { TerrainBuilder } from './TerrainBuilder';
 import { ChunkManager } from './ChunkManager';
 import { MapEditor } from './MapEditor';
 import { DebugUI } from './DebugUI';
-import { MAPS, getMap, DEFAULT_MAP } from '../shared/MapRegistry.js';
+import { getMap, DEFAULT_MAP } from '../shared/MapRegistry.js';
 import { PortalFX } from './PortalFX.js';
 
 // Initialize Supabase Client
