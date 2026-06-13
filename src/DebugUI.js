@@ -15,7 +15,7 @@
  *   debug.dispose();     // call on cleanup
  */
 import * as THREE from 'three';
-import { CHUNK_SIZE } from './shared/TerrainChunk.js';
+import { CHUNK_SIZE } from '../shared/TerrainChunk.js';
 
 const HEIGHT_COLORS = [
   { t: 0.0, color: new THREE.Color(0x1a5fb4) },

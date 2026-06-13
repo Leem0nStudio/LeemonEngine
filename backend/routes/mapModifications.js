@@ -27,7 +27,7 @@ const MAX_MODS_PER_CHUNK = 200;
  * Create the Express router for map modifications.
  * @param {import("@supabase/supabase-js").SupabaseClient | null} supabase
  * @param {boolean} useMockDb
- * @param {Map} mockDb
+ * @param {any} mockDb
  * @returns {express.Router}
  */
 export function createMapModificationsRouter(supabase, useMockDb, mockDb) {

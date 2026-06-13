@@ -87,6 +87,10 @@ const BIOME_COLORS = {
 
 // ─── Generate Geometry Data ───────────────────────────────────────────────
 function generateGeometry(seed, cx, cz) {
+  // Use a slightly larger grid (CHUNK_SIZE + 1) to eliminate gaps between chunks
+  const gridCount = CHUNK_SIZE + 1;
+  const vertexCount = gridCount * gridCount;
+
   const chunkSeed = seed + cx * 73856093 ^ cz * 19349669;
   const heightNoise = createNoise2D(mulberry32(chunkSeed));
   const biomeNoise = createNoise2D(mulberry32(seed + 9999));
@@ -94,21 +98,20 @@ function generateGeometry(seed, cx, cz) {
 
   const worldOffsetX = cx * CHUNK_SIZE;
   const worldOffsetZ = cz * CHUNK_SIZE;
-  const vertexCount = CHUNK_SIZE * CHUNK_SIZE;
 
   const positions = new Float32Array(vertexCount * 3);
   const colors = new Float32Array(vertexCount * 3);
-  const biomeMap = new Array(CHUNK_SIZE);
-  const heightmap = new Array(CHUNK_SIZE);
+  const biomeMap = new Array(gridCount);
+  const heightmap = new Array(gridCount);
 
-  for (let lz = 0; lz < CHUNK_SIZE; lz++) {
-    heightmap[lz] = new Float32Array(CHUNK_SIZE);
-    biomeMap[lz] = new Array(CHUNK_SIZE);
+  for (let lz = 0; lz < gridCount; lz++) {
+    heightmap[lz] = new Float32Array(gridCount);
+    biomeMap[lz] = new Array(gridCount);
 
-    for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+    for (let lx = 0; lx < gridCount; lx++) {
       const wx = worldOffsetX + lx;
       const wz = worldOffsetZ + lz;
-      const i = lz * CHUNK_SIZE + lx;
+      const i = lz * gridCount + lx;
 
       const weights = getBiomeWeights(wx, wz, biomeNoise);
       let h = 0;
@@ -139,7 +142,7 @@ function generateGeometry(seed, cx, cz) {
       // Slope-based coloring
       const palette = BIOME_COLORS[primaryBiome] || BIOME_COLORS.prairie;
       let slope = 0;
-      if (lz > 0 && lz < CHUNK_SIZE - 1 && lx > 0 && lx < CHUNK_SIZE - 1) {
+      if (lz > 0 && lz < gridCount - 1 && lx > 0 && lx < gridCount - 1) {
         const sx = Math.abs(heightmap[lz][lx + 1] - heightmap[lz][lx - 1]) / 2;
         const sz = Math.abs(heightmap[lz + 1]?.[lx] - heightmap[lz - 1]?.[lx]) / 2 || 0;
         slope = Math.sqrt(sx * sx + sz * sz);
@@ -163,14 +166,14 @@ function generateGeometry(seed, cx, cz) {
   }
 
   // Indices
-  const indexCount = (CHUNK_SIZE - 1) * (CHUNK_SIZE - 1) * 6;
+  const indexCount = CHUNK_SIZE * CHUNK_SIZE * 6;
   const indices = new Uint32Array(indexCount);
   let idx = 0;
-  for (let lz = 0; lz < CHUNK_SIZE - 1; lz++) {
-    for (let lx = 0; lx < CHUNK_SIZE - 1; lx++) {
-      const tl = lz * CHUNK_SIZE + lx;
+  for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+    for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+      const tl = lz * gridCount + lx;
       const tr = tl + 1;
-      const bl = (lz + 1) * CHUNK_SIZE + lx;
+      const bl = (lz + 1) * gridCount + lx;
       const br = bl + 1;
       indices[idx++] = tl;
       indices[idx++] = bl;

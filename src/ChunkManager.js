@@ -119,12 +119,34 @@ export class ChunkManager {
     this.chunks = new Map(); // key: "cx,cz" -> { data, mesh, decorations, ... }
     this.lastPlayerChunk = { cx: -999, cz: -999 };
 
+    // Resource cache to prevent redundant GPU uploads and GC pressure
+    this._materials = new Map();
+    this._geometries = new Map();
+
     // Shared geometries for instancing
-    this._treeTrunkGeo = new THREE.CylinderGeometry(0.15, 0.25, 1, 6);
-    this._treeCanopyGeo = new THREE.SphereGeometry(1, 6, 5);
-    this._rockGeo = new THREE.DodecahedronGeometry(0.5, 0);
-    this._bushGeo = new THREE.SphereGeometry(0.4, 5, 4);
-    this._flowerGeo = new THREE.ConeGeometry(0.1, 0.3, 4);
+    this._rockGeo = this._getSharedGeometry('rock_base', () => new THREE.DodecahedronGeometry(0.5, 0));
+    this._bushGeo = this._getSharedGeometry('bush_base', () => new THREE.SphereGeometry(0.4, 5, 4));
+    this._flowerGeo = this._getSharedGeometry('flower_base', () => new THREE.ConeGeometry(0.1, 0.3, 4));
+  }
+
+  /**
+   * Helper to get or create a shared material.
+   */
+  _getSharedMaterial(key, createFn) {
+    if (!this._materials.has(key)) {
+      this._materials.set(key, createFn());
+    }
+    return this._materials.get(key);
+  }
+
+  /**
+   * Helper to get or create a shared geometry.
+   */
+  _getSharedGeometry(key, createFn) {
+    if (!this._geometries.has(key)) {
+      this._geometries.set(key, createFn());
+    }
+    return this._geometries.get(key);
   }
 
   /**
@@ -242,10 +264,12 @@ export class ChunkManager {
     geometry.setIndex(new THREE.BufferAttribute(workerData.indices, 1));
     geometry.computeVertexNormals();
 
-    const material = new THREE.MeshLambertMaterial({
+    const material = this._getSharedMaterial('terrain_mat', () => new THREE.MeshStandardMaterial({
       vertexColors: true,
       side: THREE.FrontSide,
-    });
+      roughness: 0.8,
+      metalness: 0.1,
+    }));
 
     const mesh = new THREE.Mesh(geometry, material);
     mesh.receiveShadow = true;
@@ -269,17 +293,17 @@ export class ChunkManager {
    */
   _buildTerrainMesh(data) {
     const { heightmap, biomeMap } = data;
-    const size = CHUNK_SIZE;
+    const gridCount = CHUNK_SIZE + 1;
 
     const geometry = new THREE.BufferGeometry();
-    const vertexCount = size * size;
+    const vertexCount = gridCount * gridCount;
     const positions = new Float32Array(vertexCount * 3);
     const colors = new Float32Array(vertexCount * 3);
     const tmpColor = new THREE.Color();
 
-    for (let lz = 0; lz < size; lz++) {
-      for (let lx = 0; lx < size; lx++) {
-        const i = lz * size + lx;
+    for (let lz = 0; lz < gridCount; lz++) {
+      for (let lx = 0; lx < gridCount; lx++) {
+        const i = lz * gridCount + lx;
         const h = heightmap[lz][lx];
         const biome = biomeMap[lz][lx];
         const palette = BIOME_COLORS[biome] || BIOME_COLORS.prairie;
@@ -290,7 +314,7 @@ export class ChunkManager {
 
         // Slope-based coloring
         let slope = 0;
-        if (lz > 0 && lz < size - 1 && lx > 0 && lx < size - 1) {
+        if (lz > 0 && lz < gridCount - 1 && lx > 0 && lx < gridCount - 1) {
           const sx = Math.abs(heightmap[lz][lx + 1] - heightmap[lz][lx - 1]) / 2;
           const sz = Math.abs(heightmap[lz + 1][lx] - heightmap[lz - 1][lx]) / 2;
           slope = Math.sqrt(sx * sx + sz * sz);
@@ -316,11 +340,11 @@ export class ChunkManager {
 
     // Indices
     const indices = [];
-    for (let lz = 0; lz < size - 1; lz++) {
-      for (let lx = 0; lx < size - 1; lx++) {
-        const tl = lz * size + lx;
+    for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+        const tl = lz * gridCount + lx;
         const tr = tl + 1;
-        const bl = (lz + 1) * size + lx;
+        const bl = (lz + 1) * gridCount + lx;
         const br = bl + 1;
         indices.push(tl, bl, tr, tr, bl, br);
       }
@@ -331,10 +355,12 @@ export class ChunkManager {
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
 
-    const material = new THREE.MeshLambertMaterial({
+    const material = this._getSharedMaterial('terrain_mat', () => new THREE.MeshStandardMaterial({
       vertexColors: true,
       side: THREE.FrontSide,
-    });
+      roughness: 0.8,
+      metalness: 0.1,
+    }));
 
     const mesh = new THREE.Mesh(geometry, material);
     mesh.receiveShadow = true;
@@ -366,8 +392,10 @@ export class ChunkManager {
         const cfg = TREE_CONFIGS[first.subType] || TREE_CONFIGS.oak;
 
         // Trunk instances
-        const trunkGeo = new THREE.CylinderGeometry(cfg.trunkR * 0.7, cfg.trunkR, cfg.trunkH, 6);
-        const trunkMat = new THREE.MeshLambertMaterial({ color: cfg.trunkColor });
+        const trunkGeo = this._getSharedGeometry(`tree_trunk_${first.subType}`, () =>
+          new THREE.CylinderGeometry(cfg.trunkR * 0.7, cfg.trunkR, cfg.trunkH, 6));
+        const trunkMat = this._getSharedMaterial(`tree_trunk_mat_${cfg.trunkColor}`, () =>
+          new THREE.MeshStandardMaterial({ color: cfg.trunkColor, roughness: 0.9 }));
         const trunkMesh = new THREE.InstancedMesh(trunkGeo, trunkMat, decs.length);
         trunkMesh.castShadow = true;
 
@@ -384,8 +412,10 @@ export class ChunkManager {
 
         // Canopy instances (if tree has canopy)
         if (cfg.canopyR > 0) {
-          const canopyGeo = new THREE.SphereGeometry(cfg.canopyR, 6, 5);
-          const canopyMat = new THREE.MeshLambertMaterial({ color: cfg.canopyColor });
+          const canopyGeo = this._getSharedGeometry(`tree_canopy_${first.subType}`, () =>
+            new THREE.SphereGeometry(cfg.canopyR, 6, 5));
+          const canopyMat = this._getSharedMaterial(`tree_canopy_mat_${cfg.canopyColor}`, () =>
+            new THREE.MeshStandardMaterial({ color: cfg.canopyColor, roughness: 0.8 }));
           const canopyMesh = new THREE.InstancedMesh(canopyGeo, canopyMat, decs.length);
           canopyMesh.castShadow = true;
 
@@ -401,7 +431,8 @@ export class ChunkManager {
           result.push(canopyMesh);
         }
       } else if (first.type === "rock") {
-        const mat = new THREE.MeshLambertMaterial({ color: ROCK_COLORS[0] });
+        const mat = this._getSharedMaterial(`rock_mat_${ROCK_COLORS[0]}`, () =>
+          new THREE.MeshStandardMaterial({ color: ROCK_COLORS[0], roughness: 0.7, metalness: 0.2 }));
         const mesh = new THREE.InstancedMesh(this._rockGeo, mat, decs.length);
         mesh.castShadow = true;
 
@@ -418,7 +449,8 @@ export class ChunkManager {
         mesh.instanceMatrix.needsUpdate = true;
         result.push(mesh);
       } else if (first.type === "bush") {
-        const mat = new THREE.MeshLambertMaterial({ color: 0x388e3c });
+        const mat = this._getSharedMaterial('bush_mat', () =>
+          new THREE.MeshStandardMaterial({ color: 0x388e3c, roughness: 0.8 }));
         const mesh = new THREE.InstancedMesh(this._bushGeo, mat, decs.length);
         mesh.castShadow = true;
 
@@ -434,7 +466,8 @@ export class ChunkManager {
         result.push(mesh);
       } else if (first.type === "flower") {
         const colors = [0xff69b4, 0xffeb3b, 0xe91e63, 0x9c27b0, 0xff5722];
-        const mat = new THREE.MeshBasicMaterial({ color: colors[0] });
+        const mat = this._getSharedMaterial(`flower_mat_${colors[0]}`, () =>
+          new THREE.MeshBasicMaterial({ color: colors[0] }));
         const mesh = new THREE.InstancedMesh(this._flowerGeo, mat, decs.length);
 
         const dummy = new THREE.Object3D();
@@ -455,18 +488,22 @@ export class ChunkManager {
 
   /**
    * Unload a chunk and dispose its GPU resources.
+   * Only disposes of unique resources (like terrain geometry).
+   * Shared materials and decoration geometries are kept in the cache.
    */
   _unloadChunk(chunk) {
     if (!chunk || !chunk.meshes) return;
     for (const mesh of chunk.meshes) {
       this.scene.remove(mesh);
-      mesh.traverse((child) => {
-        if (child.geometry) child.geometry.dispose();
-        if (child.material) {
-          if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
-          else child.material.dispose();
-        }
-      });
+
+      // Only dispose of unique geometry (terrain mesh geometry is unique per chunk)
+      if (mesh.userData.isTerrain && mesh.geometry) {
+        mesh.geometry.dispose();
+      }
+
+      // Shared materials and geometries (used by InstancedMesh decorations)
+      // are NOT disposed here because they are managed by the resource cache
+      // and will be reused by other chunks.
     }
   }
 
@@ -478,6 +515,18 @@ export class ChunkManager {
       this._unloadChunk(chunk);
     }
     this.chunks.clear();
+
+    // Dispose cached materials
+    for (const mat of this._materials.values()) {
+      mat.dispose();
+    }
+    this._materials.clear();
+
+    // Dispose cached geometries
+    for (const geo of this._geometries.values()) {
+      geo.dispose();
+    }
+    this._geometries.clear();
 
     // Terminate worker
     if (chunkWorker) {
