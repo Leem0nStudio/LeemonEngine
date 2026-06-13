@@ -114,6 +114,7 @@ export default function App() {
 
     channel.on('broadcast', { event: 'move' }, (payload) => {
       const { playerId, x, z, name } = payload;
+      if (!Number.isFinite(x) || !Number.isFinite(z)) return;
       playersDataRef.current.set(playerId, { x, z, name });
       updatePlayerPosition(playerId, x, z, name);
     });
@@ -121,6 +122,7 @@ export default function App() {
     channel.on('broadcast', { event: 'join' }, (payload) => {
       const { playerId, x, z, name } = payload;
       if (playerId !== localPlayerId.current) {
+        if (!Number.isFinite(x) || !Number.isFinite(z)) return;
         playersDataRef.current.set(playerId, { x, z, name });
         updatePlayerPosition(playerId, x, z, name);
       }
@@ -266,8 +268,8 @@ export default function App() {
     currentMapId.current = DEFAULT_MAP;
     const mapDef = getMap(DEFAULT_MAP);
     const spawn = mapDef?.spawnPoint || { x: 100, z: 100 };
-    const finalX = (posX === 100 && posZ === 100) ? spawn.x : posX;
-    const finalZ = (posZ === 100 && posX === 100) ? spawn.z : posZ;
+    let finalX = (posX === 100 && posZ === 100) ? spawn.x : posX;
+    let finalZ = (posZ === 100 && posX === 100) ? spawn.z : posZ;
 
     playersDataRef.current.set(charId, { x: finalX, z: finalZ, name: charName });
 
@@ -275,6 +277,12 @@ export default function App() {
       config: { seed: mapDef?.seed || 42, size: mapDef?.size || 200 },
       spawnPoint: { x: finalX, z: finalZ },
     };
+
+    if (!Number.isFinite(finalX) || !Number.isFinite(finalZ)) {
+      console.warn('[App] Invalid spawn position, using default', { finalX, finalZ });
+      finalX = 100;
+      finalZ = 100;
+    }
 
     if (!isMockAuth) {
       setupRealtime(charId, charName, finalX, finalZ);
@@ -343,6 +351,10 @@ export default function App() {
 
   const updatePlayerPosition = (id: string, gridX: number, gridZ: number, name?: string) => {
     if (!sceneRef.current || !charSpriteMaterial.current) return;
+    if (!Number.isFinite(gridX) || !Number.isFinite(gridZ)) {
+      console.warn('[App] Ignoring NaN position for player', id, gridX, gridZ);
+      return;
+    }
 
     // New terrain: grid coordinates = world coordinates (1 unit per cell)
     const worldX = gridX;
@@ -486,7 +498,7 @@ export default function App() {
     const width = mountRef.current.clientWidth;
     const height = mountRef.current.clientHeight;
     const aspect = width / height;
-    const viewSize = 45; // Shows ~45 units of the 200-unit world (closer view)
+    const viewSize = 70; // Shows ~70 units of the 200-unit world
     const camera = new THREE.OrthographicCamera(
       -viewSize * aspect / 2, viewSize * aspect / 2,
       viewSize / 2, -viewSize / 2,
