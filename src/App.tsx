@@ -3,11 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, FormEvent } from 'react';
 import * as THREE from 'three';
 import { createClient, type SupabaseClient, type User, type Session } from '@supabase/supabase-js';
 
 import characterTextureUrl from './assets/character.png';
+import { TerrainBuilder } from './TerrainBuilder';
 import { ChunkManager } from './ChunkManager';
 import { MapEditor } from './MapEditor';
 import { DebugUI } from './DebugUI';
@@ -176,7 +177,7 @@ export default function App() {
   };
 
   // ── Auth Handlers ──
-  const handleAuthSubmit = async (e: React.FormEvent) => {
+  const handleAuthSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setErrorMessage('');
     if (!email.trim() || !password.trim()) { setErrorMessage("Please fill all fields"); return; }
@@ -434,7 +435,8 @@ export default function App() {
     // 8b. E key to toggle map editor
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key.toLowerCase() === 'e' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+        const target = e.target as HTMLElement;
+        if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
         if (mapEditorRef.current) {
           mapEditorRef.current.toggle();
         }

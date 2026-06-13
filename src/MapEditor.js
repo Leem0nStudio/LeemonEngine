@@ -147,7 +147,8 @@ export class MapEditor {
     if (!this.enabled) return;
 
     // Don't capture if typing in an input
-    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+    const target = e.target;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
 
     switch (e.key.toLowerCase()) {
       case "1":
@@ -217,7 +218,8 @@ export class MapEditor {
    * Handle mouse down – start applying tool.
    */
   _onMouseDown(e) {
-    if (!this.enabled || e.target.tagName !== "CANVAS") return;
+    const target = e.target;
+    if (!this.enabled || !target || target.tagName !== "CANVAS") return;
     if (e.button !== 0) return; // Left click only
 
     this.isMouseDown = true;
