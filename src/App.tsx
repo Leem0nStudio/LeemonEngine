@@ -493,12 +493,6 @@ export default function App() {
       0.1, 500,
     );
     cameraRef.current = camera;
-    // Initial camera position: look at spawn from isometric angle
-    const spawnX = mapData.spawnPoint?.x || 100;
-    const spawnZ = mapData.spawnPoint?.z || 100;
-    const spawnH = chunkManager.getHeight(spawnX, spawnZ) || 0;
-    camera.position.set(spawnX + 40, spawnH + 40, spawnZ + 40);
-    camera.lookAt(spawnX, spawnH, spawnZ);
     scene.add(camera);
 
     // 4. Renderer
@@ -524,6 +518,13 @@ export default function App() {
     // Build prefabs (statics placed at fixed world coords)
     chunkManager.buildPrefabs();
     console.log('[Terrain] Chunk system ready. Scene children:', scene.children.length);
+
+    // Initial camera position: look at spawn from isometric angle
+    const spawnX = mapData.spawnPoint?.x || 100;
+    const spawnZ = mapData.spawnPoint?.z || 100;
+    const spawnH = chunkManager.getHeight(spawnX, spawnZ) || 0;
+    camera.position.set(spawnX + 40, spawnH + 40, spawnZ + 40);
+    camera.lookAt(spawnX, spawnH, spawnZ);
 
     // 5b. Map Editor (E key toggle)
     const mapEditor = new MapEditor(scene, camera, chunkManager);
