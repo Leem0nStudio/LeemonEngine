@@ -26,7 +26,6 @@ let workerIdCounter = 0;
 try {
   chunkWorker = new Worker(
     new URL("./workers/chunkWorker.js", import.meta.url),
-    { type: "module" }
   );
   chunkWorker.onmessage = (e) => {
     const { id, type } = e.data;
@@ -42,7 +41,7 @@ try {
     chunkWorker = null;
   };
 } catch (e) {
-  console.warn("[ChunkManager] Web Workers not available, using main thread");
+    console.warn("[ChunkManager] Web Workers not available, using main thread:", e);
 }
 
 function generateChunkAsync(seed, cx, cz) {
