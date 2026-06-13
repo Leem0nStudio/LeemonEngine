@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useRef, useState, FormEvent } from 'react';
+import React, { useEffect, useRef, useState, FormEvent, useCallback } from 'react';
 import * as THREE from 'three';
-import { createClient, type SupabaseClient, type User, type Session } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient, type User, type Session, type RealtimeChannel } from '@supabase/supabase-js';
 
 import characterTextureUrl from './assets/character.png';
 import { TerrainBuilder } from './TerrainBuilder';
@@ -41,7 +41,8 @@ export default function App() {
   const [joined, setJoined] = useState(false);
   const [characterId, setCharacterId] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
-  const ws = useRef<WebSocket | null>(null);
+  const [playerName, setPlayerName] = useState('');
+  const realtimeChannel = useRef<RealtimeChannel | null>(null);
 
   // THREE.js state
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -94,66 +95,47 @@ export default function App() {
     }
   }, []);
 
-  // ── WebSocket Setup ──
-  const connectWebSocket = (charId: string, token: string) => {
-    if (ws.current) ws.current.close();
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(`${protocol}//${window.location.host}`);
-    ws.current = socket;
+  // ── Supabase Realtime Setup ──
+  const setupRealtime = useCallback((charId: string, charName: string, startX: number, startZ: number) => {
+    if (realtimeChannel.current) {
+      supabase?.removeChannel(realtimeChannel.current);
+    }
 
-    socket.onopen = () => {
-      setStatus('Connected');
-      socket.send(JSON.stringify({ type: 'join', token, characterId: charId }));
-    };
+    const channel = supabase!.channel('game:positions', {
+      config: { broadcast: { self: false } },
+    });
 
-    socket.onmessage = (event) => {
-      let msg;
-      try { msg = JSON.parse(event.data); } catch (e) { return; }
+    channel.on('broadcast', { event: 'move' }, (payload) => {
+      const { playerId, x, z, name } = payload;
+      playersDataRef.current.set(playerId, { x, z, name });
+      updatePlayerPosition(playerId, x, z, name);
+    });
 
-      if (msg.type === 'init') {
-        localPlayerId.current = msg.player.id;
-        playersDataRef.current.clear();
-        msg.players.forEach((p: { id: string; x: number; z: number; name?: string }) => {
-          playersDataRef.current.set(p.id, { x: p.x, z: p.z, name: p.name });
-        });
-        // Store map data for terrain building
-        mapDataRef.current = msg.map;
-        setJoined(true);
-        setErrorMessage('');
-      } else if (msg.type === 'moved') {
-        playersDataRef.current.set(msg.id, { x: msg.x, z: msg.z, name: msg.name });
-        updatePlayerPosition(msg.id, msg.x, msg.z, msg.name);
-      } else if (msg.type === 'left') {
-        removePlayer(msg.id);
-      } else if (msg.type === 'map_change') {
-        // Server sent new map data after portal transition
-        localPlayerId.current = msg.player.id;
-        // Dispose old terrain before loading new map
-        if (terrainBuilderRef.current) {
-          terrainBuilderRef.current.dispose();
-          terrainBuilderRef.current = null;
-        }
-        mapDataRef.current = msg.map;
-        // Clear all existing player sprites (they'll be re-created from moved msgs)
-        playersDataRef.current.clear();
-        playersRef.current.forEach((group) => {
-          sceneRef.current?.remove(group);
-        });
-        playersRef.current.clear();
-        // Toggle joined to trigger scene rebuild via useEffect
-        setJoined(false);
-        requestAnimationFrame(() => {
-          setJoined(true);
-        });
-      } else if (msg.type === 'error') {
-        setErrorMessage(msg.message);
-        setJoined(false);
-        ws.current?.close();
+    channel.on('broadcast', { event: 'join' }, (payload) => {
+      const { playerId, x, z, name } = payload;
+      if (playerId !== localPlayerId.current) {
+        playersDataRef.current.set(playerId, { x, z, name });
+        updatePlayerPosition(playerId, x, z, name);
       }
-    };
+    });
 
-    socket.onclose = () => setStatus('Disconnected');
-  };
+    channel.on('broadcast', { event: 'leave' }, (payload) => {
+      removePlayer(payload.playerId);
+    });
+
+    channel.subscribe(async (subStatus) => {
+      if (subStatus === 'SUBSCRIBED') {
+        channel.send({
+          type: 'broadcast',
+          event: 'join',
+          payload: { playerId: charId, x: startX, z: startZ, name: charName },
+        });
+        setStatus('Online');
+      }
+    });
+
+    realtimeChannel.current = channel;
+  }, []);
 
   // ── Characters Fetch Helpers ──
   const fetchMockCharacters = (userId: string) => {
@@ -202,8 +184,12 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
-    ws.current?.close();
+    if (realtimeChannel.current) {
+      supabase?.removeChannel(realtimeChannel.current);
+      realtimeChannel.current = null;
+    }
     setJoined(false);
+    setStatus('Disconnected');
     if (isMockAuth) {
       localStorage.removeItem('mock_user');
       setUser(null);
@@ -234,14 +220,68 @@ export default function App() {
     }
   };
 
-  const handleSelectCharacter = (charId: string) => {
+  const handleSelectCharacter = async (charId: string) => {
     setCharacterId(charId);
-    connectWebSocket(charId, sessionToken);
+    setErrorMessage('');
+
+    let charName = charId;
+    let posX = 100;
+    let posZ = 100;
+
+    if (isMockAuth) {
+      const saved = localStorage.getItem(`mock_chars_${user!.id}`);
+      if (saved) {
+        const chars = JSON.parse(saved);
+        const found = chars.find((c: any) => c.id === charId);
+        if (found) {
+          charName = found.name;
+          posX = (found.pos_x === 2) ? 100 : (found.pos_x ?? 100);
+          posZ = (found.pos_z === 2) ? 100 : (found.pos_z ?? 100);
+        }
+      }
+    } else {
+      const { data: char } = await supabase!
+        .from('characters')
+        .select('name, pos_x, pos_z')
+        .eq('id', charId)
+        .single();
+      if (char) {
+        charName = char.name;
+        posX = (char.pos_x === 2) ? 100 : (char.pos_x ?? 100);
+        posZ = (char.pos_z === 2) ? 100 : (char.pos_z ?? 100);
+      }
+    }
+
+    localPlayerId.current = charId;
+    setPlayerName(charName);
+    playersDataRef.current.clear();
+    playersDataRef.current.set(charId, { x: posX, z: posZ, name: charName });
+
+    mapDataRef.current = {
+      config: { seed: 42, size: 200 },
+      spawnPoint: { x: posX, z: posZ },
+    };
+
+    if (!isMockAuth) {
+      setupRealtime(charId, charName, posX, posZ);
+    } else {
+      setStatus('Offline (mock)');
+    }
+    setJoined(true);
   };
 
   const handleLeaveGame = () => {
-    ws.current?.close();
+    if (realtimeChannel.current) {
+      realtimeChannel.current.send({
+        type: 'broadcast',
+        event: 'leave',
+        payload: { playerId: localPlayerId.current },
+      });
+      supabase?.removeChannel(realtimeChannel.current);
+      realtimeChannel.current = null;
+    }
     setJoined(false);
+    setStatus('Disconnected');
     if (chunkManagerRef.current) {
       chunkManagerRef.current.dispose();
       chunkManagerRef.current = null;
@@ -440,10 +480,34 @@ export default function App() {
       for (const hit of intersects) {
         if (hit.object instanceof THREE.Mesh && hit.object.userData.isTerrain) {
           const { x, z } = hit.point;
-          // Use ChunkManager for height lookup
           const gridX = Math.round(x);
           const gridZ = Math.round(z);
-          ws.current?.send(JSON.stringify({ type: 'move', x: gridX, z: gridZ }));
+
+          // Basic client-side validation
+          const cm = chunkManagerRef.current;
+          if (cm) {
+            const h = cm.getHeight(gridX, gridZ);
+            if (gridX < 0 || gridX >= 200 || gridZ < 0 || gridZ >= 200) break;
+            const circles = cm.getCollisionCircles(gridX, gridZ, 3);
+            let blocked = false;
+            for (const c of circles) {
+              const dx = gridX - c.x;
+              const dz = gridZ - c.z;
+              if (Math.sqrt(dx * dx + dz * dz) < c.radius) { blocked = true; break; }
+            }
+            if (blocked) break;
+
+            // Update local state
+            playersDataRef.current.set(localPlayerId.current!, { x: gridX, z: gridZ, name: playerName });
+            updatePlayerPosition(localPlayerId.current!, gridX, gridZ, playerName);
+
+            // Broadcast to other players
+            realtimeChannel.current?.send({
+              type: 'broadcast',
+              event: 'move',
+              payload: { playerId: localPlayerId.current!, x: gridX, z: gridZ, name: playerName },
+            });
+          }
           break;
         }
       }
@@ -627,7 +691,7 @@ export default function App() {
               Seed: <span className="text-slate-300 font-mono">{mapDataRef.current?.config?.seed || '—'}</span>
             </p>
             <p className="text-slate-400 text-xs">
-              Status: <span className="text-emerald-400">Online</span>
+               Status: <span className="text-emerald-400">{status}</span>
             </p>
           </div>
           <div className="absolute top-4 right-4 flex gap-2 z-20">
