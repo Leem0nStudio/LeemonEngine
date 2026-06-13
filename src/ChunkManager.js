@@ -396,8 +396,8 @@ export class ChunkManager {
         const i = lz * gridCount + lx;
         const h = heightmap[lz][lx];
         const biome = biomeMap[lz][lx];
-        const colors = getBiomeColors();
-        const palette = colors[biome] || colors.prairie;
+        const biomeColors = getBiomeColors();
+        const palette = biomeColors[biome] || biomeColors.prairie;
 
         positions[i * 3] = data.worldOffsetX + lx;
         positions[i * 3 + 1] = h;
