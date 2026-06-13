@@ -625,12 +625,8 @@ export class ChunkManager {
     }
     this._geometries.clear();
 
-    // Terminate worker
-    if (chunkWorker) {
-      chunkWorker.terminate();
-      chunkWorker = null;
-    }
-    workerCallbacks.clear();
+    // Don't terminate worker - it's shared across ChunkManager instances
+    // Stale callbacks will timeout naturally
   }
 
   /**
