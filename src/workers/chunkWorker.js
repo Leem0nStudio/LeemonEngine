@@ -92,9 +92,9 @@ function generateGeometry(seed, cx, cz) {
   const vertexCount = gridCount * gridCount;
 
   const chunkSeed = seed + cx * 73856093 ^ cz * 19349669;
-  const heightNoise = createNoise2D(mulberry32(chunkSeed));
+  const heightNoise = createNoise2D(mulberry32(seed));
   const biomeNoise = createNoise2D(mulberry32(seed + 9999));
-  const detailNoise = createNoise2D(mulberry32(chunkSeed + 1));
+  const detailNoise = createNoise2D(mulberry32(seed + 1));
 
   const worldOffsetX = cx * CHUNK_SIZE;
   const worldOffsetZ = cz * CHUNK_SIZE;
