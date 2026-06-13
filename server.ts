@@ -6,9 +6,13 @@ import crypto from "crypto";
 import dotenv from "dotenv";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import {
-  generateTerrain,
   MAX_SLOPE_DEG,
 } from "./backend/terrainGenerator.js";
+import {
+  generateChunk,
+  sampleHeight,
+  CHUNK_SIZE
+} from "./shared/TerrainChunk.js";
 import { Quadtree, buildQuadtree } from "./backend/Quadtree.js";
 import { createMapModificationsRouter } from "./backend/routes/mapModifications.js";
 
@@ -44,23 +48,35 @@ if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
 // The terrain data is generated once and reused for every player on that map.
 interface MapInstance {
   seed: number;
-  data: ReturnType<typeof generateTerrain>;
-  quadtree: Quadtree;
+  spawnPoint: { x: number, z: number };
+  quadtrees: Map<string, Quadtree>;
 }
 const activeMaps = new Map<number, MapInstance>();
 
 function getOrGenerateMap(seed: number): MapInstance {
   if (activeMaps.has(seed)) return activeMaps.get(seed)!;
-  const data = generateTerrain(seed);
 
-  // Build quadtree for efficient collision queries
-  const bounds = { x: 0, z: 0, width: data.config.size, height: data.config.size };
-  const quadtree = buildQuadtree(data.collisionCircles, bounds);
+  // Use (0,0) chunk for spawn reference or deterministic spawn
+  const spawnPoint = { x: 100, z: 100 };
 
-  const instance: MapInstance = { seed, data, quadtree };
+  const instance: MapInstance = {
+    seed,
+    spawnPoint,
+    quadtrees: new Map()
+  };
   activeMaps.set(seed, instance);
-  console.log(`Generated terrain: seed=${seed} ${data.config.size}x${data.config.size} (${data.collisionCircles.length} collision objects in quadtree)`);
   return instance;
+}
+
+function getQuadtreeForChunk(mapInstance: MapInstance, cx: number, cz: number): Quadtree {
+  const key = `${cx},${cz}`;
+  if (mapInstance.quadtrees.has(key)) return mapInstance.quadtrees.get(key)!;
+
+  const data = generateChunk(mapInstance.seed, cx, cz);
+  const bounds = { x: cx * CHUNK_SIZE, z: cz * CHUNK_SIZE, width: CHUNK_SIZE, height: CHUNK_SIZE };
+  const quadtree = buildQuadtree(data.collisionCircles, bounds);
+  mapInstance.quadtrees.set(key, quadtree);
+  return quadtree;
 }
 
 // ─── In-memory Player Sync ──────────────────────────────────────────────────
@@ -196,7 +212,7 @@ async function startServer() {
         // Determine starting map
         const startSeed = 42;
         const mapInstance = getOrGenerateMap(startSeed);
-        const { spawnPoint } = mapInstance.data;
+        const spawnPoint = mapInstance.spawnPoint;
 
         // New characters (pos_x=2, pos_z=2) start at spawn point
         // Returning characters use their saved position
@@ -219,12 +235,15 @@ async function startServer() {
           .filter((p) => p.mapSeed === player.mapSeed)
           .map((p) => ({ id: p.id, name: p.name, x: p.x, z: p.z }));
 
-        // Send init with terrain data so the client can build the world
+        // Send init with config so the client can build the world
         ws.send(JSON.stringify({
           type: "init",
           player: { id: player.id, name: player.name, x: player.x, z: player.z },
           players: serializedPlayers,
-          map: mapInstance.data,
+          map: {
+            config: { seed: startSeed, size: 200 }, // Size is for legacy UI
+            spawnPoint: spawnPoint
+          },
         }));
 
         // Broadcast spawn to other players on the same map
@@ -250,26 +269,29 @@ async function startServer() {
         const mapInstance = activeMaps.get(player.mapSeed);
         if (!mapInstance) return;
 
-        const { heightmap, config } = mapInstance.data;
-        const size = config.size;
+        const cellSize = 1;
 
-        // 1. Bounds check
-        if (x < 0 || x >= size || z < 0 || z >= size) return;
+        // 1. Bounds check (infinite map, but let's keep a reasonable range for MVP)
+        if (Math.abs(x) > 10000 || Math.abs(z) > 10000) return;
 
         // 2. Slope check – prevent walking up impossibly steep terrain
-        const currentH = heightmap[player.z]?.[player.x] ?? 0;
-        const targetH = heightmap[z]?.[x] ?? 0;
+        const currentH = sampleHeight(mapInstance.seed, player.x, player.z);
+        const targetH = sampleHeight(mapInstance.seed, x, z);
         const heightDiff = Math.abs(targetH - currentH);
         const dx = Math.abs(x - player.x);
         const dz = Math.abs(z - player.z);
         const horizDist = (dx > 0 && dz > 0)
-          ? config.cellSize * Math.SQRT2
-          : config.cellSize;
+          ? cellSize * Math.SQRT2
+          : cellSize;
         const slopeDeg = Math.atan2(heightDiff, horizDist) * (180 / Math.PI);
         if (slopeDeg > MAX_SLOPE_DEG) return;
 
-        // 3. Decoration collision check via quadtree (O(log n) instead of O(n))
-        const nearby = mapInstance.quadtree.queryRadius(x, z, 3);
+        // 3. Decoration collision check via chunk-based quadtrees
+        const cx = Math.floor(x / CHUNK_SIZE);
+        const cz = Math.floor(z / CHUNK_SIZE);
+        const qt = getQuadtreeForChunk(mapInstance, cx, cz);
+
+        const nearby = qt.queryRadius(x, z, 3);
         for (const circle of nearby) {
           const cdx = x - circle.x;
           const cdz = z - circle.z;

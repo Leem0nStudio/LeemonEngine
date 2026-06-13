@@ -291,17 +291,17 @@ export class ChunkManager {
    */
   _buildTerrainMesh(data) {
     const { heightmap, biomeMap } = data;
-    const size = CHUNK_SIZE;
+    const gridCount = CHUNK_SIZE + 1;
 
     const geometry = new THREE.BufferGeometry();
-    const vertexCount = size * size;
+    const vertexCount = gridCount * gridCount;
     const positions = new Float32Array(vertexCount * 3);
     const colors = new Float32Array(vertexCount * 3);
     const tmpColor = new THREE.Color();
 
-    for (let lz = 0; lz < size; lz++) {
-      for (let lx = 0; lx < size; lx++) {
-        const i = lz * size + lx;
+    for (let lz = 0; lz < gridCount; lz++) {
+      for (let lx = 0; lx < gridCount; lx++) {
+        const i = lz * gridCount + lx;
         const h = heightmap[lz][lx];
         const biome = biomeMap[lz][lx];
         const palette = BIOME_COLORS[biome] || BIOME_COLORS.prairie;
@@ -312,7 +312,7 @@ export class ChunkManager {
 
         // Slope-based coloring
         let slope = 0;
-        if (lz > 0 && lz < size - 1 && lx > 0 && lx < size - 1) {
+        if (lz > 0 && lz < gridCount - 1 && lx > 0 && lx < gridCount - 1) {
           const sx = Math.abs(heightmap[lz][lx + 1] - heightmap[lz][lx - 1]) / 2;
           const sz = Math.abs(heightmap[lz + 1][lx] - heightmap[lz - 1][lx]) / 2;
           slope = Math.sqrt(sx * sx + sz * sz);
@@ -338,11 +338,11 @@ export class ChunkManager {
 
     // Indices
     const indices = [];
-    for (let lz = 0; lz < size - 1; lz++) {
-      for (let lx = 0; lx < size - 1; lx++) {
-        const tl = lz * size + lx;
+    for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+        const tl = lz * gridCount + lx;
         const tr = tl + 1;
-        const bl = (lz + 1) * size + lx;
+        const bl = (lz + 1) * gridCount + lx;
         const br = bl + 1;
         indices.push(tl, bl, tr, tr, bl, br);
       }

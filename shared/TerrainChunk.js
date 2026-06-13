@@ -150,11 +150,15 @@ export function getBiomeWeights(wx, wz, biomeNoise) {
 }
 
 // ─── River Generation ───────────────────────────────────────────────────────
+const riverCache = new Map(); // seed -> Set
+
 /**
  * Generates river paths as a set of "x,z" strings.
  * Rivers flow from north to south using noise-guided random walk.
  */
 export function generateRivers(seed, numRivers = 3) {
+  if (riverCache.has(seed)) return riverCache.get(seed);
+
   const rng = mulberry32(seed + 5000);
   const rivers = new Set();
   const worldSize = 256; // reasonable world size for chunk-based system
@@ -179,6 +183,7 @@ export function generateRivers(seed, numRivers = 3) {
       z += 1;
     }
   }
+  riverCache.set(seed, rivers);
   return rivers;
 }
 
@@ -221,14 +226,15 @@ export function generateChunk(seed, cx, cz, overrides = null) {
   const dominantBiome = getBiomeAt(centerX, centerZ, biomeNoise);
 
   // Generate heightmap
+  const gridCount = CHUNK_SIZE + 1;
   const heightmap = [];
   const biomeMap = [];
 
-  for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+  for (let lz = 0; lz < gridCount; lz++) {
     heightmap[lz] = [];
     biomeMap[lz] = [];
 
-    for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+    for (let lx = 0; lx < gridCount; lx++) {
       const wx = worldOffsetX + lx;
       const wz = worldOffsetZ + lz;
 

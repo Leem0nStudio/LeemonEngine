@@ -345,8 +345,26 @@ export default function App() {
     // Fog for atmosphere on large world
     scene.fog = new THREE.Fog(0x87ceeb, 60, 150);
 
-    // 2. Lighting – TerrainBuilder handles its own lighting, just add a basic ambient
-    // (TerrainBuilder will add hemisphere + directional + ambient)
+    // 2. Lighting
+    const hemiLight = new THREE.HemisphereLight(0x87ceeb, 0x4caf50, 0.7);
+    scene.add(hemiLight);
+
+    const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+    sun.position.set(80, 120, 80);
+    sun.castShadow = true;
+    sun.shadow.mapSize.width = 2048;
+    sun.shadow.mapSize.height = 2048;
+    const d = 100;
+    sun.shadow.camera.left = -d;
+    sun.shadow.camera.right = d;
+    sun.shadow.camera.top = d;
+    sun.shadow.camera.bottom = -d;
+    sun.shadow.camera.near = 0.5;
+    sun.shadow.camera.far = 300;
+    scene.add(sun);
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.35);
+    scene.add(ambient);
 
     // 3. Camera – orthographic for 2.5D Ragnarok style
     const width = mountRef.current.clientWidth;
@@ -397,7 +415,7 @@ export default function App() {
     charSpriteMaterial.current = new THREE.SpriteMaterial({
       map: characterTexture,
       transparent: true,
-      alphaTest: 0.1,
+      alphaTest: 0.5, // Higher alpha test to fix edge artifacts
     });
 
     // 7. Render existing players

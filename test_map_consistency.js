@@ -250,8 +250,9 @@ console.log("\n🧪 Test 13: Chunk generation determinism");
 {
   const a = generateChunk(42, 0, 0);
   const b = generateChunk(42, 0, 0);
-  assert(a.heightmap.length === CHUNK_SIZE, "Chunk row count correct");
-  assert(a.heightmap[0].length === CHUNK_SIZE, "Chunk col count correct");
+  const gridCount = CHUNK_SIZE + 1; // 33 vertices for 32 cells
+  assert(a.heightmap.length === gridCount, "Chunk row count correct");
+  assert(a.heightmap[0].length === gridCount, "Chunk col count correct");
   assert(JSON.stringify(a.heightmap) === JSON.stringify(b.heightmap), "Same seed+chunk → same heightmap");
   assert(JSON.stringify(a.biomeMap) === JSON.stringify(b.biomeMap), "Same seed+chunk → same biome map");
 }
