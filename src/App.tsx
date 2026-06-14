@@ -710,6 +710,17 @@ export default function App() {
     let animationId: number;
     let portalTime = 0;
     let lastBroadcastPos = { x: 0, z: 0 };
+    // NaN diagnostic
+    const nanScan = setInterval(() => {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+      let node;
+      while (node = walker.nextNode()) {
+        if (/NaN/.test(node.textContent || '')) {
+          console.warn('[NaN] Found in text node:', node.textContent?.substring(0, 80), 'parent:', node.parentNode?.nodeName || '?');
+        }
+      }
+    }, 3000);
+
     function animate() {
       animationId = requestAnimationFrame(animate);
 
@@ -789,6 +800,7 @@ export default function App() {
 
     return () => {
       cancelAnimationFrame(animationId);
+      clearInterval(nanScan);
       window.removeEventListener('resize', handleResize);
       mountRef.current?.removeEventListener('click', handleClick);
       mountRef.current?.removeEventListener('touchstart', handleTouchStart);
