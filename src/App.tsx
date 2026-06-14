@@ -66,6 +66,8 @@ export default function App() {
   // Map state
   const currentMapId = useRef<string>(DEFAULT_MAP);
   const portalObjects = useRef<PortalFX[]>([]);
+  const playerTarget = useRef<{ x: number; z: number } | null>(null);
+  const MOVE_SPEED = 4;
   const fadeOverlay = useRef<HTMLDivElement | null>(null);
 
   // ── Supabase / Mock Auth Session Loader ──
@@ -607,16 +609,8 @@ export default function App() {
             }
             if (blocked) break;
 
-            // Update local state
-            playersDataRef.current.set(localPlayerId.current!, { x: gridX, z: gridZ, name: playerName });
-            updatePlayerPosition(localPlayerId.current!, gridX, gridZ, playerName);
-
-            // Broadcast to other players
-            realtimeChannel.current?.send({
-              type: 'broadcast',
-              event: 'move',
-              payload: { playerId: localPlayerId.current!, x: gridX, z: gridZ, name: playerName },
-            });
+            // Set movement target (smooth walking)
+            playerTarget.current = { x: gridX, z: gridZ };
 
             // Portal detection
             const curMap = getMap(currentMapId.current);
@@ -671,8 +665,66 @@ export default function App() {
     // 10. Animation loop
     let animationId: number;
     let portalTime = 0;
+    let lastBroadcastPos = { x: 0, z: 0 };
     function animate() {
       animationId = requestAnimationFrame(animate);
+
+      // Smooth movement toward target
+      const localId = localPlayerId.current;
+      const target = playerTarget.current;
+      if (target && localId) {
+        const pos = playersDataRef.current.get(localId);
+        if (pos) {
+          const dx = target.x - pos.x;
+          const dz = target.z - pos.z;
+          const dist = Math.sqrt(dx * dx + dz * dz);
+          const cm = chunkManagerRef.current;
+
+          if (dist > 0.5) {
+            const step = Math.min(MOVE_SPEED * 0.016, dist);
+            const nx = pos.x + (dx / dist) * step;
+            const nz = pos.z + (dz / dist) * step;
+            const nxi = Math.round(nx);
+            const nzi = Math.round(nz);
+
+            // Collision check at next step
+            let blocked = false;
+            if (cm) {
+              const circles = cm.getCollisionCircles(nxi, nzi, 3);
+              for (const c of circles) {
+                if (Math.sqrt((nxi - c.x) ** 2 + (nzi - c.z) ** 2) < c.radius) {
+                  blocked = true;
+                  break;
+                }
+              }
+            }
+
+            if (!blocked) {
+              pos.x = nx;
+              pos.z = nz;
+              updatePlayerPosition(localId, nx, nz, pos.name);
+
+              // Throttle broadcasts to avoid spam
+              const bd = Math.sqrt((pos.x - lastBroadcastPos.x) ** 2 + (pos.z - lastBroadcastPos.z) ** 2);
+              if (bd >= 1) {
+                lastBroadcastPos = { x: pos.x, z: pos.z };
+                realtimeChannel.current?.send({
+                  type: 'broadcast',
+                  event: 'move',
+                  payload: { playerId: localId, x: Math.round(pos.x), z: Math.round(pos.z), name: pos.name },
+                });
+              }
+            }
+          } else {
+            // Arrived at target
+            playerTarget.current = null;
+            // Snap to exact grid position
+            pos.x = target.x;
+            pos.z = target.z;
+            updatePlayerPosition(localId, target.x, target.z, pos.name);
+          }
+        }
+      }
 
       // Update chunk streaming based on local player position
       const localPlayer = playersDataRef.current.get(localPlayerId.current || '');
