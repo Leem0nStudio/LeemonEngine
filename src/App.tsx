@@ -500,7 +500,9 @@ export default function App() {
     const width = mountRef.current.clientWidth;
     const height = mountRef.current.clientHeight;
     const aspect = width / height;
-    const viewSize = 70; // Shows ~70 units of the 200-unit world
+    let viewSize = 70; // Shows ~70 units of the 200-unit world (zoomable)
+    const MIN_ZOOM = 20;
+    const MAX_ZOOM = 150;
     const camera = new THREE.OrthographicCamera(
       -viewSize * aspect / 2, viewSize * aspect / 2,
       viewSize / 2, -viewSize / 2,
@@ -662,6 +664,48 @@ export default function App() {
     };
     window.addEventListener('resize', handleResize);
 
+    // 9b. Touch handlers (mobile)
+    let touchDist = 0;
+    const handleTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        const dx = e.touches[0].clientX - e.touches[1].clientX;
+        const dy = e.touches[0].clientY - e.touches[1].clientY;
+        touchDist = Math.sqrt(dx * dx + dy * dy);
+      }
+    };
+    const handleTouchMove = (e: TouchEvent) => {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        const dx = e.touches[0].clientX - e.touches[1].clientX;
+        const dy = e.touches[0].clientY - e.touches[1].clientY;
+        const newDist = Math.sqrt(dx * dx + dy * dy);
+        const scale = touchDist / newDist;
+        viewSize = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, viewSize * scale));
+        touchDist = newDist;
+        const a = (mountRef.current?.clientWidth || 1) / (mountRef.current?.clientHeight || 1);
+        camera.left = -viewSize * a / 2;
+        camera.right = viewSize * a / 2;
+        camera.top = viewSize / 2;
+        camera.bottom = -viewSize / 2;
+        camera.updateProjectionMatrix();
+      }
+    };
+    mountRef.current.addEventListener('touchstart', handleTouchStart, { passive: false });
+    mountRef.current.addEventListener('touchmove', handleTouchMove, { passive: false });
+
+    // 9c. Scroll wheel zoom
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      viewSize = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, viewSize + e.deltaY * 0.15));
+      const a = (mountRef.current?.clientWidth || 1) / (mountRef.current?.clientHeight || 1);
+      camera.left = -viewSize * a / 2;
+      camera.right = viewSize * a / 2;
+      camera.top = viewSize / 2;
+      camera.bottom = -viewSize / 2;
+      camera.updateProjectionMatrix();
+    };
+    mountRef.current.addEventListener('wheel', handleWheel, { passive: false });
+
     // 10. Animation loop
     let animationId: number;
     let portalTime = 0;
@@ -747,6 +791,9 @@ export default function App() {
       cancelAnimationFrame(animationId);
       window.removeEventListener('resize', handleResize);
       mountRef.current?.removeEventListener('click', handleClick);
+      mountRef.current?.removeEventListener('touchstart', handleTouchStart);
+      mountRef.current?.removeEventListener('touchmove', handleTouchMove);
+      mountRef.current?.removeEventListener('wheel', handleWheel);
       document.removeEventListener('keydown', handleKeyDown);
 
       // Dispose portals
