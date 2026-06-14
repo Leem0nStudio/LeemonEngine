@@ -89,14 +89,42 @@ export class ChunkManager {
    */
   buildPrefabs() {
     const cfg = this.mapConfig;
-    if (!cfg || !cfg.prefabs || cfg.prefabs.length === 0) return;
-    for (const pf of cfg.prefabs) {
-      const h = this.getHeight(pf.x, pf.z);
-      const group = this._buildSinglePrefab(pf, h);
-      if (group) {
-        this.scene.add(group);
-        this._prefabGroups.push(group);
+    if (cfg && cfg.prefabs && cfg.prefabs.length > 0) {
+      for (const pf of cfg.prefabs) {
+        const h = this.getHeight(pf.x, pf.z);
+        const group = this._buildSinglePrefab(pf, h);
+        if (group) {
+          this.scene.add(group);
+          this._prefabGroups.push(group);
+        }
       }
+    }
+    this._buildBoundaries();
+  }
+
+  _buildBoundaries() {
+    const worldSize = 200;
+    const wallH = 6;
+    const half = worldSize / 2;
+    const wallMat = this._getSharedMaterial('boundary_mat', () => new THREE.MeshLambertMaterial({
+      color: 0x1e293b,
+      transparent: true,
+      opacity: 0.25,
+    }));
+
+    const walls = [
+      { x: half, z: 0, w: worldSize, d: 0.5 },
+      { x: half, z: worldSize, w: worldSize, d: 0.5 },
+      { x: 0, z: half, w: 0.5, d: worldSize },
+      { x: worldSize, z: half, w: 0.5, d: worldSize },
+    ];
+
+    for (const w of walls) {
+      const geo = new THREE.BoxGeometry(w.w, wallH, w.d);
+      const mesh = new THREE.Mesh(geo, wallMat);
+      mesh.position.set(w.x, wallH / 2 - 0.5, w.z);
+      this.scene.add(mesh);
+      this._prefabGroups.push(mesh);
     }
   }
 
@@ -215,6 +243,10 @@ export class ChunkManager {
     // 1. Terrain mesh (with vertex colors)
     const terrainMesh = this._buildTerrainMesh(data);
     meshes.push(terrainMesh);
+
+    // 1b. Water mesh for rivers
+    const waterMesh = this._buildWaterMesh(data);
+    if (waterMesh) meshes.push(waterMesh);
 
     // 2. Decoration instances
     const decMeshes = this._buildDecorationMeshes(data);
@@ -347,6 +379,54 @@ export class ChunkManager {
     const mesh = new THREE.Mesh(geometry, material);
     mesh.receiveShadow = true;
     mesh.userData.isTerrain = true;
+    mesh.userData.chunkCx = data.cx;
+    mesh.userData.chunkCz = data.cz;
+    return mesh;
+  }
+
+  _buildWaterMesh(data) {
+    const { riverMap, waterLevel, worldOffsetX, worldOffsetZ } = data;
+    if (!riverMap) return null;
+
+    const positions = [];
+    const gridCount = riverMap.length;
+    if (gridCount === 0) return null;
+
+    for (let lz = 0; lz < gridCount; lz++) {
+      for (let lx = 0; lx < gridCount; lx++) {
+        if (!riverMap[lz]?.[lx]) continue;
+        const wx = worldOffsetX + lx;
+        const wz = worldOffsetZ + lz;
+        positions.push(
+          wx - 0.5, waterLevel, wz - 0.5,
+          wx + 0.5, waterLevel, wz - 0.5,
+          wx + 0.5, waterLevel, wz + 0.5,
+          wx - 0.5, waterLevel, wz + 0.5,
+        );
+      }
+    }
+
+    if (positions.length === 0) return null;
+
+    const vertCount = positions.length / 3;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+
+    const indices = [];
+    for (let i = 0; i < vertCount; i += 4) {
+      indices.push(i, i + 1, i + 2, i, i + 2, i + 3);
+    }
+    geo.setIndex(indices);
+    geo.computeVertexNormals();
+
+    const mat = this._getSharedMaterial('water_mat', () => new THREE.MeshLambertMaterial({
+      color: 0x1a6ba0,
+      transparent: true,
+      opacity: 0.6,
+    }));
+
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.userData.isWater = true;
     mesh.userData.chunkCx = data.cx;
     mesh.userData.chunkCz = data.cz;
     return mesh;

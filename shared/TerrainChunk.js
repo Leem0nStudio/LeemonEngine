@@ -34,7 +34,7 @@ export const BIOMES = {
     name: "prairie",
     groundColor: [0.35, 0.65, 0.25],
     dirtColor: [0.55, 0.42, 0.28],
-    amplitude: 2.5,
+    amplitude: 6.0,
     frequency: 0.015,
     treeProbability: 0.005,
     rockProbability: 0.003,
@@ -47,7 +47,7 @@ export const BIOMES = {
     name: "forest",
     groundColor: [0.2, 0.5, 0.15],
     dirtColor: [0.45, 0.35, 0.22],
-    amplitude: 3.5,
+    amplitude: 8.0,
     frequency: 0.02,
     treeProbability: 0.04,
     rockProbability: 0.005,
@@ -60,7 +60,7 @@ export const BIOMES = {
     name: "desert",
     groundColor: [0.85, 0.78, 0.55],
     dirtColor: [0.75, 0.65, 0.42],
-    amplitude: 1.5,
+    amplitude: 4.0,
     frequency: 0.008,
     treeProbability: 0.001,
     rockProbability: 0.008,
@@ -73,7 +73,7 @@ export const BIOMES = {
     name: "snow",
     groundColor: [0.92, 0.95, 0.98],
     dirtColor: [0.7, 0.72, 0.75],
-    amplitude: 4.0,
+    amplitude: 10.0,
     frequency: 0.018,
     treeProbability: 0.008,
     rockProbability: 0.006,
@@ -86,7 +86,7 @@ export const BIOMES = {
     name: "swamp",
     groundColor: [0.3, 0.45, 0.25],
     dirtColor: [0.4, 0.38, 0.2],
-    amplitude: 0.8,
+    amplitude: 3.0,
     frequency: 0.025,
     treeProbability: 0.015,
     rockProbability: 0.002,
@@ -229,10 +229,12 @@ export function generateChunk(seed, cx, cz, overrides = null, blockedDecorations
   const gridCount = CHUNK_SIZE + 1;
   const heightmap = [];
   const biomeMap = [];
+  const riverMap = [];
 
   for (let lz = 0; lz < gridCount; lz++) {
     heightmap[lz] = [];
     biomeMap[lz] = [];
+    riverMap[lz] = [];
 
     for (let lx = 0; lx < gridCount; lx++) {
       const wx = worldOffsetX + lx;
@@ -263,13 +265,15 @@ export function generateChunk(seed, cx, cz, overrides = null, blockedDecorations
       }
 
       // River carving: lower terrain where rivers flow
-      if (isRiver(wx, wz, riverSet)) {
+      const isRiverCell = isRiver(wx, wz, riverSet);
+      if (isRiverCell) {
         h = Math.min(h, -0.5); // Carve river bed
         primaryBiome = "swamp"; // Rivers count as swamp biome
       }
 
       heightmap[lz][lx] = h;
       biomeMap[lz][lx] = primaryBiome;
+      riverMap[lz][lx] = isRiverCell;
     }
   }
 
@@ -410,6 +414,8 @@ export function generateChunk(seed, cx, cz, overrides = null, blockedDecorations
     cx, cz,
     heightmap,
     biomeMap,
+    riverMap,
+    waterLevel: -0.4,
     dominantBiome,
     decorations,
     collisionCircles,
